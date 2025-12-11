@@ -1,10 +1,10 @@
-# ⚡️ Cloudflare Workers 节点管理系统 (v10.7)
+# ⚡️ Cloudflare Workers 优选IP管理系统 (v10.7)
 
 ![Version](https://img.shields.io/badge/Version-v10.7-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/Platform-Cloudflare%20Workers-orange?style=flat-square)
 ![Storage](https://img.shields.io/badge/Storage-R2%20%2B%20KV-green?style=flat-square)
 
-这是一个基于 Cloudflare Workers + KV + R2 构建的无服务器（Serverless）代理节点管理系统。它提供了一个功能强大的 Web 界面，用于聚合、提取、去重、测试和管理您的节点订阅。
+这是一个基于 Cloudflare Workers + KV + R2 构建的无服务器（Serverless）代理优选IP管理系统。它提供了一个功能强大的 Web 界面，用于聚合、提取、去重、测试和管理您的优选IP。
 
 **v10.7 版本重点修复了浏览器缓存导致的文件回滚问题，并增强了对 URL-Safe Base64 的解码支持。**
 
@@ -17,7 +17,7 @@
 
 ## ✨ 核心功能
 
-* **多源聚合**: 支持订阅链接、API 接口、自定义文本、本地文件上传（支持 CSV/TXT）等多种数据源。
+* **多源聚合**: 支持订阅链接（提取订阅链接IP和端口以及备注）、API 接口、自定义文本、本地文件上传（支持 CSV/TXT）等多种数据源。
 * **智能提取**:
     * 支持解析 Vmess, Vless, Trojan, SS, SSR 等多种协议。
     * **v10.7 增强**: 深度优化 Base64 解码，支持 URL-Safe 字符 (`-`, `_`)，解决部分机场订阅无法识别的问题。
