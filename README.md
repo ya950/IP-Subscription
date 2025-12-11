@@ -14,7 +14,7 @@
 
 | 主控制台 / 数据源管理 | 提取与测试 |
 | :---: | :---: |
-| ![Dashboard](https://via.placeholder.com/600x400?text=Dashboard+Screenshot) | ![Extract](https://via.placeholder.com/600x400?text=Extract+Preview) |
+| ![Dashboard](https://via.placeholder.com/600x400?text=Dashboard+Screenshot) | ![Extract](https://imgbed.1990909.xyz/file/blog/1765479271932_image.png) |
 
 ## ✨ 核心功能
 
