@@ -1,19 +1,17 @@
-// Cloudflare Workers 节点管理系统 v9.9.4 (自定义命名版)
+// Cloudflare Workers 节点管理系统 v10.7 (Base64修复+缓存修复版)
 // ==========================================
-// 更新日志 v9.9.4:
-// 1. [修复] 修复重置统计API路径错误问题
-// 2. [修复] 修复北京时间显示不准确的问题
-// 3. [修复] 修复TG上传显示成功但实际未上传的问题
-// 4. [修复] 修复删除操作后刷新又回来的问题
-// 5. [优化] 改进错误处理和日志记录
-// 6. [功能] 包含 v9.9.3 的所有功能
+// 更新日志 v10.7 修复版:
+// 1. [修复] 解决了可编辑文件保存后，因浏览器缓存导致刷新页面时文件列表消失的问题
+// 2. [修复] 增强了 Base64 解码能力，支持 URL-Safe 字符 (-/_)，解决了部分订阅链接无法提取 IP 的问题
+// 3. [逻辑] 优化了可编辑文件的元数据同步逻辑
 // ==========================================
 
 const KV_BINDING_NAME = "IP_NODES"; 
-const TG_FILE_LIMIT = 5 * 1024 * 1024; // 5MB
+const R2_BUCKET_NAME = "NODE_FILES"; 
+const TG_FILE_LIMIT = 5 * 1024 * 1024;
 
 // ==========================================
-// 1. 核心工具模块
+// 1. 核心工具模块 (后端用)
 // ==========================================
 const IPExtractor = {
   COMMON_PORTS: new Set([80, 443, 8080, 8443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8880]),
@@ -125,61 +123,263 @@ const IPExtractor = {
         if (ip) results.push({ ip, port: port || '443', remark: extractedRemark });
     }
     return results;
+  },
+  
+  deduplicateIPs(ipList) {
+    const seen = new Set();
+    const deduplicated = [];
+    for (const item of ipList) {
+      const key = `${item.ip}:${item.port || 443}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduplicated.push(item);
+      }
+    }
+    return deduplicated;
   }
 };
 
 // ==========================================
-// 2. Worker 入口
+// 2. 缓存管理器
+// ==========================================
+const CacheManager = {
+  getCacheKey(type, name) { return `cache_v10_${type}_${name}`; },
+  async setCache(env, type, key, data) { await env[KV_BINDING_NAME].put(this.getCacheKey(type, key), JSON.stringify(data), { expirationTtl: 1800 }); },
+  async getCache(env, type, key) { return await env[KV_BINDING_NAME].get(this.getCacheKey(type, key), { type: 'json' }); },
+  async clearCache(env, type, key) { await env[KV_BINDING_NAME].delete(this.getCacheKey(type, key)); },
+  async clearTypeCache(env, type) {
+    const list = await env[KV_BINDING_NAME].list({ prefix: `cache_v10_${type}_` });
+    for (const key of list.keys) await env[KV_BINDING_NAME].delete(key.name);
+  }
+};
+
+// ==========================================
+// 3. R2存储管理器
+// ==========================================
+const R2Manager = {
+  getPath(type, name) {
+    const paths = { upload: `uploads/${name}`, generated: `generated/${name}`, config: `config/${name}.json`, stats: `stats/${name}.json`, editable: `editable/${name}.json` };
+    return paths[type] || name;
+  },
+  async save(env, type, name, content, metadata = {}) {
+    const path = this.getPath(type, name);
+    try {
+      const body = typeof content === 'object' ? JSON.stringify(content) : content;
+      const contentType = typeof content === 'object' ? 'application/json' : 'text/plain; charset=utf-8';
+      await env[R2_BUCKET_NAME].put(path, body, { httpMetadata: { contentType, ...metadata }, customMetadata: { type, name, updatedAt: new Date().toISOString() } });
+      return true;
+    } catch (error) { console.error(`R2 save error:`, error); return false; }
+  },
+  async read(env, type, name) {
+    const path = this.getPath(type, name);
+    try {
+      const object = await env[R2_BUCKET_NAME].get(path);
+      if (!object) return null;
+      if (type === 'config' || type === 'stats' || type === 'editable') return await object.json();
+      return await object.text();
+    } catch (error) { return null; }
+  },
+  async delete(env, type, name) {
+    const path = this.getPath(type, name);
+    try { await env[R2_BUCKET_NAME].delete(path); return true; } catch (error) { return false; }
+  }
+};
+
+// ==========================================
+// 4. 数据访问层
+// ==========================================
+const DataAccessLayer = {
+  async readFile(env, type, name) {
+    const cached = await CacheManager.getCache(env, 'file_content', name);
+    if (cached) return cached;
+    const content = await R2Manager.read(env, type, name);
+    if (content) {
+      if (content.length < 10 * 1024 * 1024) await CacheManager.setCache(env, 'file_content', name, content);
+    }
+    return content;
+  },
+  async writeFile(env, type, name, content) {
+    const saved = await R2Manager.save(env, type, name, content);
+    if (saved) {
+      if (content.length < 10 * 1024 * 1024) await CacheManager.setCache(env, 'file_content', name, content);
+      else await CacheManager.clearCache(env, 'file_content', name);
+    }
+    return saved;
+  },
+  async deleteFile(env, type, name) {
+    await CacheManager.clearCache(env, 'file_content', name);
+    return await R2Manager.delete(env, type, name);
+  },
+  async readConfig(env, key, defaultValue = [], forceRefresh = false) {
+    if (!forceRefresh) { const cached = await CacheManager.getCache(env, 'metadata', key); if (cached) return cached; }
+    const data = await R2Manager.read(env, 'config', key);
+    const result = data || defaultValue;
+    await CacheManager.setCache(env, 'metadata', key, result);
+    return result;
+  },
+  async writeConfig(env, key, data) {
+    await R2Manager.save(env, 'config', key, data);
+    await CacheManager.setCache(env, 'metadata', key, data);
+  },
+  async getManifest(env) {
+    const cached = await CacheManager.getCache(env, 'manifest', 'all');
+    if (cached) return cached;
+    const data = await R2Manager.read(env, 'config', 'manifest');
+    const result = data || {};
+    await CacheManager.setCache(env, 'manifest', 'all', result);
+    return result;
+  },
+  async updateManifest(env, fileName, metaData) {
+    const manifest = await this.getManifest(env);
+    if (metaData === null) delete manifest[fileName]; else manifest[fileName] = metaData;
+    await R2Manager.save(env, 'config', 'manifest', manifest);
+    await CacheManager.setCache(env, 'manifest', 'all', manifest);
+    return manifest;
+  },
+  async getStats(env, fileName) {
+    let stats = await env[KV_BINDING_NAME].get(`stats_${fileName}`, { type: 'json' });
+    if (!stats) stats = await R2Manager.read(env, 'stats', `stats_${fileName}`);
+    return stats || { total: 0, today: 0, lastAccess: null };
+  },
+  async updateStats(env, fileName, statsData) {
+    await env[KV_BINDING_NAME].put(`stats_${fileName}`, JSON.stringify(statsData));
+  },
+  async syncStatsToR2(env) {
+    const list = await env[KV_BINDING_NAME].list({ prefix: 'stats_' });
+    for (const key of list.keys) {
+        try { const data = await env[KV_BINDING_NAME].get(key.name, { type: 'json' }); if (data) await R2Manager.save(env, 'stats', key.name, data); } catch(e) {}
+    }
+  },
+  async getEditableFile(env, fileName) { return await R2Manager.read(env, 'editable', fileName); },
+  async saveEditableFile(env, fileName, data) { return await R2Manager.save(env, 'editable', fileName, data); },
+  async deleteEditableFile(env, fileName) { return await R2Manager.delete(env, 'editable', fileName); }
+};
+
+// ==========================================
+// 5. Worker 入口
 // ==========================================
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
-
     if (path === '/api/tg_hook' && request.method === 'POST') return await handleTelegramWebhook(request, env);
-
     if (!env.ADMIN_PASSWORD) return new Response("配置错误: 请在环境变量中设置 ADMIN_PASSWORD", { status: 500 });
-
-    if ((path.startsWith('/ip/') && path.length > 4) || (path.length > 1 && path !== '/admin' && path !== '/' && !path.startsWith('/api/'))) {
-      return await handleIPFile(request, env, ctx, path);
-    }
+    if (path.startsWith('/r2/')) return await handleR2FileAccess(request, env, ctx, path);
+    if ((path.startsWith('/ip/') && path.length > 4) || (path.length > 1 && path !== '/admin' && path !== '/' && !path.startsWith('/api/'))) return await handleIPFile(request, env, ctx, path);
     if (path === '/admin' || path === '/') return await handleAdmin(request, env);
     if (path.startsWith('/api/')) return await handleAPI(request, env, path);
-
     return Response.redirect(url.origin + '/admin', 302);
   },
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(handleCronJob(env));
-  }
+  async scheduled(event, env, ctx) { ctx.waitUntil(handleCronJob(env)); }
 };
 
 // ==========================================
-// 3. API 逻辑
+// 6. 核心处理函数
+// ==========================================
+async function handleR2FileAccess(request, env, ctx, path) {
+  const fileName = path.replace('/r2/', '');
+  try {
+    const manifest = await DataAccessLayer.getManifest(env);
+    const fileMeta = manifest[fileName];
+    let content;
+    if (fileMeta && fileMeta.editable) {
+       // 仍然允许通过直链访问，但UI层不展示
+      const editableData = await DataAccessLayer.getEditableFile(env, fileName);
+      if (editableData && editableData.ips) {
+        content = editableData.ips.map(ip => ip.port ? `${ip.ip}:${ip.port}${ip.remark ? '#' + ip.remark : ''}` : `${ip.ip}${ip.remark ? '#' + ip.remark : ''}`).join('\n');
+      }
+    } else {
+      const object = await env[R2_BUCKET_NAME].get(`generated/${fileName}`);
+      if (!object) return new Response('File not found in R2 (Generated)', { status: 404 });
+      content = await object.text();
+    }
+    if (!content) return new Response('File not found', { status: 404 });
+    ctx.waitUntil(updateFileStats(env, fileName));
+    return new Response(content, { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0' } });
+  } catch (error) { return new Response(`Error: ${error.message}`, { status: 500 }); }
+}
+
+async function handleIPFile(request, env, ctx, path) {
+  const fileName = path.replace('/ip/', '').replace(/^\//, '');
+  try {
+    const manifest = await DataAccessLayer.getManifest(env);
+    const fileMeta = manifest[fileName];
+    let content;
+    if (fileMeta && fileMeta.editable) {
+      // 仍然允许访问，但UI不展示
+      const editableData = await DataAccessLayer.getEditableFile(env, fileName);
+      if (editableData && editableData.ips) {
+        content = editableData.ips.map(ip => ip.port ? `${ip.ip}:${ip.port}${ip.remark ? '#' + ip.remark : ''}` : `${ip.ip}${ip.remark ? '#' + ip.remark : ''}`).join('\n');
+      }
+    } else {
+      content = await DataAccessLayer.readFile(env, 'generated', fileName);
+    }
+    if (!content) return new Response('IP file not found', { status: 404 });
+    ctx.waitUntil(updateFileStats(env, fileName));
+    return new Response(content, { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0' } });
+  } catch (error) { return new Response('Error', { status: 500 }); }
+}
+
+async function updateFileStats(env, fileName) {
+    try {
+        let stats = await DataAccessLayer.getStats(env, fileName);
+        const now = new Date();
+        const beijingTime = new Date(now.toLocaleString("en-US", {timeZone: "Asia/Shanghai"}));
+        const todayStr = beijingTime.toISOString().split('T')[0];
+        if (stats.date !== todayStr) { stats.date = todayStr; stats.today = 0; }
+        stats.total = (stats.total || 0) + 1; 
+        stats.today = (stats.today || 0) + 1;
+        stats.lastAccess = now.toISOString();
+        await DataAccessLayer.updateStats(env, fileName, stats);
+    } catch(e) {}
+}
+
+async function handleCronJob(env) {
+  try {
+    await CacheManager.clearTypeCache(env, 'file_content');
+    await DataAccessLayer.syncStatsToR2(env);
+    const manifest = await DataAccessLayer.getManifest(env);
+    let updatedCount = 0;
+    for (const [fileName, meta] of Object.entries(manifest)) {
+      if (meta && meta.autoUpdate && !meta.editable) {
+        const r = await performExtraction(env, meta.sources);
+        await DataAccessLayer.writeFile(env, 'generated', fileName, r.join('\n'));
+        meta.lastUpdate = new Date().toISOString(); 
+        await DataAccessLayer.updateManifest(env, fileName, meta);
+        updatedCount++;
+      }
+    }
+    console.log(`Cron job finished. Updated ${updatedCount} files.`);
+  } catch (e) { console.error("Cron job failed:", e); }
+}
+
+// ==========================================
+// 7. API 逻辑
 // ==========================================
 async function handleAPI(request, env, path) {
   const session = await checkSession(request, env);
   if (!session && path !== '/api/login') return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
-  
   const apiAction = path.replace('/api/', '');
   try {
     switch (apiAction) {
       case 'urls':
       case 'apis':
       case 'custom':
-         if (request.method === 'GET') return await getList(env, apiAction === 'custom' ? 'custom_ips' : apiAction);
-         if (request.method === 'POST') return await addItem(request, env, apiAction);
-         if (request.method === 'DELETE' && apiAction !== 'custom') return await deleteItem(request, env, apiAction);
-         break;
+          const key = apiAction === 'custom' ? 'custom_ips' : apiAction;
+          if (request.method === 'GET') return new Response(JSON.stringify(await DataAccessLayer.readConfig(env, key)));
+          if (request.method === 'POST') return await addItem(request, env, apiAction);
+          if (request.method === 'DELETE' && apiAction !== 'custom') return await deleteItem(request, env, apiAction);
+          break;
       case 'sites':
-         if (request.method === 'GET') return await getSites(env);
-         if (request.method === 'POST') return await addSite(request, env);
-         if (request.method === 'DELETE') return await deleteSite(request, env);
-         break;
-      case 'upload': return await handleUpload(request, env);
+          if (request.method === 'GET') return new Response(JSON.stringify(await DataAccessLayer.readConfig(env, 'sites_list')));
+          if (request.method === 'POST') return await addSite(request, env);
+          if (request.method === 'DELETE') return await deleteSite(request, env);
+          break;
       case 'uploaded_files':
-         if (request.method === 'GET') return await getList(env, 'uploaded_files');
-         if (request.method === 'DELETE') return await deleteUploadedFile(request, env);
-         break;
+          if (request.method === 'GET') return new Response(JSON.stringify(await DataAccessLayer.readConfig(env, 'uploaded_files')));
+          if (request.method === 'DELETE') return await deleteUploadedFile(request, env);
+          break;
+      case 'upload': return await handleUpload(request, env);
       case 'extract': return await extractIPs(request, env);
       case 'ipfiles':
         if (request.method === 'GET') return await getIPFiles(env);
@@ -188,89 +388,267 @@ async function handleAPI(request, env, path) {
         if (request.method === 'PUT') return await updateIPFile(request, env);
         if (request.method === 'PATCH') return await editIPFileSources(request, env);
         break;
+      case 'editable_files':
+        if (request.method === 'GET') return await getEditableFiles(env);
+        if (request.method === 'POST') return await saveEditableFileAPI(request, env);
+        if (request.method === 'DELETE') return await deleteEditableFileAPI(request, env);
+        if (request.method === 'PUT') return await updateEditableFile(request, env);
+        break;
       case 'reset-stats': return await resetFileStats(request, env);
       case 'tool_query': return await handleToolQuery(request);
       case 'logout': return await logout(request, env);
     }
-  } catch (error) { 
-    console.error("API Error:", error);
-    return new Response(JSON.stringify({ error: error.message }), { status: 500 }); 
-  }
+  } catch (error) { return new Response(JSON.stringify({ error: error.message }), { status: 500 }); }
   return new Response('Not Found', { status: 404 });
 }
 
-// 修复：TG上传处理函数
+async function addItem(req, env, act) {
+  const b = await req.json(); 
+  const k = act === 'custom' ? 'custom_ips' : act; 
+  let list = [];
+  if(act === 'custom') list = b.ips || [];
+  else list = b.items || [];
+  if(act !== 'custom') { 
+      let old = await DataAccessLayer.readConfig(env, k);
+      old = old.map(x => typeof x === 'string' ? {name:'', url:x} : x);
+      list = [...old, ...list];
+  }
+  await DataAccessLayer.writeConfig(env, k, list);
+  return new Response(JSON.stringify({success:true}));
+}
+
+async function deleteItem(req, env, key) {
+  const b = await req.json(); 
+  let l = await DataAccessLayer.readConfig(env, key);
+  if (b.index >= 0) { l.splice(b.index, 1); await DataAccessLayer.writeConfig(env, key, l); return new Response(JSON.stringify({ success: true, index: b.index })); }
+  return new Response(JSON.stringify({ error: 'Invalid index' }), { status: 400 });
+}
+
+async function addSite(req, env) {
+    const b = await req.json(); 
+    let l = await DataAccessLayer.readConfig(env, 'sites_list');
+    l.push(b);
+    await DataAccessLayer.writeConfig(env, 'sites_list', l);
+    return new Response(JSON.stringify({ success: true }));
+}
+
+async function deleteSite(req, env) {
+    const b = await req.json(); 
+    let l = await DataAccessLayer.readConfig(env, 'sites_list');
+    if(b.index >= 0) { l.splice(b.index, 1); await DataAccessLayer.writeConfig(env, 'sites_list', l); return new Response(JSON.stringify({ success: true })); }
+    return new Response(JSON.stringify({ error: 'Invalid index' }));
+}
+
+// --- 文件管理相关 ---
+async function getIPFiles(env) {
+  const manifest = await DataAccessLayer.getManifest(env);
+  const result = [];
+  for (const [name, meta] of Object.entries(manifest)) {
+      const stats = await DataAccessLayer.getStats(env, name);
+      result.push({ ...meta, stats });
+  }
+  return new Response(JSON.stringify(result));
+}
+
+async function saveIPFile(req, env) {
+  const b = await req.json(); 
+  const r = await performExtraction(env, b.sources, true); 
+  const meta = { name: b.fileName, sources: b.sources, autoUpdate: b.autoUpdate, lastUpdate: new Date().toISOString() };
+  const saved = await DataAccessLayer.writeFile(env, 'generated', b.fileName, r.join('\n'));
+  if (!saved) return new Response(JSON.stringify({ error: 'R2 Write Failed' }), { status: 500 });
+  await DataAccessLayer.updateManifest(env, b.fileName, meta);
+  await DataAccessLayer.updateStats(env, b.fileName, { total: 0, today: 0, lastAccess: null });
+  return new Response(JSON.stringify({ success: true, count: r.length, meta }));
+}
+
+async function deleteIPFile(req, env) {
+  const n = new URL(req.url).searchParams.get('name');
+  if (!n) return new Response(JSON.stringify({ error: 'Missing name' }), { status: 400 });
+  const manifest = await DataAccessLayer.getManifest(env);
+  const fileMeta = manifest[n];
+  await DataAccessLayer.deleteFile(env, 'generated', n);
+  if (fileMeta && fileMeta.editable) await DataAccessLayer.deleteEditableFile(env, n);
+  await DataAccessLayer.updateManifest(env, n, null); 
+  await env[KV_BINDING_NAME].delete(`stats_${n}`);
+  return new Response(JSON.stringify({ success: true, fileName: n }));
+}
+
+async function updateIPFile(req, env) {
+    const b = await req.json();
+    const manifest = await DataAccessLayer.getManifest(env);
+    const meta = manifest[b.fileName];
+    if (!meta) throw new Error('File not found');
+    if (meta.editable) return new Response(JSON.stringify({ error: 'Editable files cannot be auto-updated' }), { status: 400 });
+    const r = await performExtraction(env, meta.sources, true); 
+    await DataAccessLayer.writeFile(env, 'generated', b.fileName, r.join('\n'));
+    meta.lastUpdate = new Date().toISOString();
+    await DataAccessLayer.updateManifest(env, b.fileName, meta);
+    return new Response(JSON.stringify({ success: true, count: r.length, meta }));
+}
+
+async function editIPFileSources(req, env) {
+    const b = await req.json();
+    const manifest = await DataAccessLayer.getManifest(env);
+    const meta = manifest[b.fileName];
+    if (!meta) throw new Error('File not found');
+    if (meta.editable) return new Response(JSON.stringify({ error: 'Editable files cannot change sources' }), { status: 400 });
+    const updatedMeta = { ...meta, sources: b.sources, autoUpdate: b.autoUpdate !== undefined ? b.autoUpdate : meta.autoUpdate, lastUpdate: new Date().toISOString() };
+    const r = await performExtraction(env, b.sources, true);
+    await DataAccessLayer.writeFile(env, 'generated', b.fileName, r.join('\n'));
+    await DataAccessLayer.updateManifest(env, b.fileName, updatedMeta);
+    return new Response(JSON.stringify({ success: true, count: r.length, meta: updatedMeta }));
+}
+
+async function resetFileStats(req, env) {
+    const { fileName } = await req.json();
+    await DataAccessLayer.updateStats(env, fileName, { total: 0, today: 0, lastAccess: null });
+    await R2Manager.save(env, 'stats', `stats_${fileName}`, { total: 0, today: 0, lastAccess: null });
+    return new Response(JSON.stringify({ success: true }));
+}
+
+// --- 可编辑文件相关 ---
+async function getEditableFiles(env) {
+  const manifest = await DataAccessLayer.getManifest(env);
+  const result = [];
+  for (const [name, meta] of Object.entries(manifest)) {
+    if (meta.editable) {
+      const stats = await DataAccessLayer.getStats(env, name);
+      const editableData = await DataAccessLayer.getEditableFile(env, name);
+      result.push({ ...meta, stats, ips: editableData ? editableData.ips : [] });
+    }
+  }
+  return new Response(JSON.stringify(result));
+}
+
+async function saveEditableFileAPI(req, env) {
+  const b = await req.json();
+  const { fileName, ips } = b;
+  if (!fileName || !ips || !Array.isArray(ips)) return new Response(JSON.stringify({ error: 'Invalid parameters' }), { status: 400 });
+  const saved = await DataAccessLayer.saveEditableFile(env, fileName, { ips });
+  if (!saved) return new Response(JSON.stringify({ error: 'R2 Write Failed' }), { status: 500 });
+  const meta = { name: fileName, editable: true, lastUpdate: new Date().toISOString(), autoUpdate: false };
+  await DataAccessLayer.updateManifest(env, fileName, meta);
+  await DataAccessLayer.updateStats(env, fileName, { total: 0, today: 0, lastAccess: null });
+  return new Response(JSON.stringify({ success: true, count: ips.length, meta }));
+}
+
+async function deleteEditableFileAPI(req, env) {
+  const b = await req.json();
+  const { fileName } = b;
+  if (!fileName) return new Response(JSON.stringify({ error: 'Missing fileName' }), { status: 400 });
+  await DataAccessLayer.deleteEditableFile(env, fileName);
+  await DataAccessLayer.updateManifest(env, fileName, null); 
+  await env[KV_BINDING_NAME].delete(`stats_${fileName}`);
+  return new Response(JSON.stringify({ success: true, fileName }));
+}
+
+// 修复: 增加元数据缺失时的自动补全，防止文件消失
+async function updateEditableFile(req, env) {
+  const b = await req.json();
+  const { fileName, ips } = b;
+  if (!fileName || !ips || !Array.isArray(ips)) return new Response(JSON.stringify({ error: 'Invalid parameters' }), { status: 400 });
+  
+  const saved = await DataAccessLayer.saveEditableFile(env, fileName, { ips });
+  if (!saved) return new Response(JSON.stringify({ error: 'R2 Write Failed' }), { status: 500 });
+  
+  const manifest = await DataAccessLayer.getManifest(env);
+  let meta = manifest[fileName];
+  
+  // 安全检查：如果 meta 不存在（可能被手动删除了或同步失败），重新创建
+  if (!meta) {
+      meta = { name: fileName, editable: true, autoUpdate: false, sources: {}, lastUpdate: new Date().toISOString() };
+  } else {
+      meta.lastUpdate = new Date().toISOString();
+  }
+  
+  await DataAccessLayer.updateManifest(env, fileName, meta);
+  return new Response(JSON.stringify({ success: true, count: ips.length }));
+}
+
+// --- 上传相关 ---
+async function handleUpload(request, env) {
+    const formData = await request.formData();
+    const file = formData.get('file');
+    if (!file) return new Response(JSON.stringify({ error: 'No file' }), { status: 400 });
+    let text = await file.text();
+    try {
+        const buffer = await file.arrayBuffer();
+        const decoder = new TextDecoder('gbk');
+        const gbkText = decoder.decode(buffer);
+        if (/[\u4e00-\u9fa5]/.test(gbkText) && !/[\u4e00-\u9fa5]/.test(text)) text = gbkText;
+    } catch (e) {}
+    const cleanNodes = IPExtractor.processBatch(text);
+    if (cleanNodes.length === 0) return new Response(JSON.stringify({ error: 'No Valid IPs' }), { status: 400 });
+    const content = cleanNodes.map(n => (n.port ? `${n.ip}:${n.port}` : n.ip) + (n.remark ? `#${n.remark}`:'')).join('\n');
+    let fileName = file.name;
+    let fileList = await DataAccessLayer.readConfig(env, 'uploaded_files');
+    if (fileList.includes(fileName)) {
+        const parts = fileName.split('.');
+        const ext = parts.length > 1 ? '.' + parts.pop() : '';
+        fileName = `${parts.join('.')}_${Math.floor(1000 + Math.random() * 9000)}${ext}`;
+    }
+    await DataAccessLayer.writeFile(env, 'upload', fileName, content);
+    fileList.push(fileName);
+    await DataAccessLayer.writeConfig(env, 'uploaded_files', fileList);
+    return new Response(JSON.stringify({ success: true, fileName, count: cleanNodes.length }));
+}
+
+async function deleteUploadedFile(req, env) {
+    const b = await req.json();
+    let fileList = await DataAccessLayer.readConfig(env, 'uploaded_files');
+    const idx = fileList.indexOf(b.fileName);
+    if (idx !== -1) {
+        fileList.splice(idx, 1);
+        await DataAccessLayer.writeConfig(env, 'uploaded_files', fileList);
+        await DataAccessLayer.deleteFile(env, 'upload', b.fileName);
+        return new Response(JSON.stringify({ success: true }));
+    }
+    return new Response(JSON.stringify({ error: 'File not found' }), { status: 404 });
+}
+
+// --- TG Bot ---
 async function handleTelegramWebhook(req, env) {
     if (!env.TG_BOT_TOKEN) return new Response('No Token', { status: 200 });
     try {
         const update = await req.json();
         if (!update.message || !update.message.document) return new Response('OK', { status: 200 });
-
         const msg = update.message;
         const chatId = msg.chat.id;
-        if (env.TG_WHITELIST_ID && String(chatId) !== String(env.TG_WHITELIST_ID)) {
-             await sendTgMsg(env, chatId, "🚫 无权访问");
-             return new Response('Unauthorized', { status: 200 });
-        }
-
+        if (env.TG_WHITELIST_ID && String(chatId) !== String(env.TG_WHITELIST_ID)) { await sendTgMsg(env, chatId, "🚫 无权访问"); return new Response('Unauthorized', { status: 200 }); }
         const doc = msg.document;
         const fileName = doc.file_name;
-        
-        if (doc.file_size && doc.file_size > TG_FILE_LIMIT) {
-             await sendTgMsg(env, chatId, "⚠️ 文件过大 (超过5MB)，请分割后上传");
-             return new Response('OK', { status: 200 });
-        }
-
-        if (!fileName.match(/\.(csv|txt)$/i)) {
-             await sendTgMsg(env, chatId, "⚠️ 仅支持 .csv 或 .txt 文件");
-             return new Response('OK', { status: 200 });
-        }
-
+        if (doc.file_size && doc.file_size > TG_FILE_LIMIT) { await sendTgMsg(env, chatId, "⚠️ 文件过大 (超过5MB)，请分割后上传"); return new Response('OK', { status: 200 }); }
+        if (!fileName.match(/\.(csv|txt)$/i)) { await sendTgMsg(env, chatId, "⚠️ 仅支持 .csv 或 .txt 文件"); return new Response('OK', { status: 200 }); }
         await sendTgMsg(env, chatId, "⏳ 正在接收并处理文件: " + fileName);
-
         const fileRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/getFile?file_id=${doc.file_id}`);
         const fileData = await fileRes.json();
         if (!fileData.ok) throw new Error('GetFile Failed');
-        
         const contentUrl = `https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${fileData.result.file_path}`;
         const contentRes = await fetch(contentUrl);
         const arrayBuffer = await contentRes.arrayBuffer();
-
         let text = new TextDecoder('utf-8').decode(arrayBuffer);
         try {
             const decoder = new TextDecoder('gbk');
             const gbkText = decoder.decode(arrayBuffer);
-            if (/[\u4e00-\u9fa5]/.test(gbkText) && !/[\u4e00-\u9fa5]/.test(text)) {
-                text = gbkText;
-            }
+            if (/[\u4e00-\u9fa5]/.test(gbkText) && !/[\u4e00-\u9fa5]/.test(text)) text = gbkText;
         } catch (e) {}
-
         const cleanNodes = IPExtractor.processBatch(text);
-        if (cleanNodes.length === 0) {
-            await sendTgMsg(env, chatId, "❌ 文件中未找到有效的IP节点");
-            return new Response('OK', { status: 200 });
-        }
-
+        if (cleanNodes.length === 0) { await sendTgMsg(env, chatId, "❌ 文件中未找到有效的IP节点"); return new Response('OK', { status: 200 }); }
         const content = cleanNodes.map(n => {
             const base = n.port ? `${n.ip}:${n.port}` : n.ip;
             return n.remark ? `${base}#${n.remark}` : base; 
         }).join('\n');
-
         let saveName = fileName;
-        let fileList = await env[KV_BINDING_NAME].get('uploaded_files', { type: 'json' }) || [];
+        let fileList = await DataAccessLayer.readConfig(env, 'uploaded_files') || [];
         if (fileList.includes(saveName)) {
             const parts = saveName.split('.');
             const ext = parts.length > 1 ? '.' + parts.pop() : '';
             saveName = `${parts.join('.')}_${Math.floor(1000 + Math.random() * 9000)}${ext}`;
         }
-        
-        // 修复：确保先保存文件内容，再更新文件列表
-        await env[KV_BINDING_NAME].put(`file_content_${saveName}`, content);
+        await DataAccessLayer.writeFile(env, 'upload', saveName, content);
         fileList.push(saveName);
-        await env[KV_BINDING_NAME].put('uploaded_files', JSON.stringify(fileList));
-
+        await DataAccessLayer.writeConfig(env, 'uploaded_files', fileList);
         await sendTgMsg(env, chatId, `✅ 上传成功!\n文件名: ${saveName}\n包含节点: ${cleanNodes.length} 个`);
-
     } catch (e) { 
         console.error('TG upload error:', e);
         await sendTgMsg(env, chatId, `❌ 上传失败: ${e.message}`);
@@ -279,490 +657,261 @@ async function handleTelegramWebhook(req, env) {
 }
 
 async function sendTgMsg(env, chatId, text) {
-    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ chat_id: chatId, text: text })
-    });
-}
-
-async function queryExternalAPI(ip, port, retry = 0) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000);
-
-    try {
-        const apiUrl = retry > 0 ? `http://ip-api.com/json/${ip}?fields=countryCode` : `https://ipinfo.io/${ip}/json`;
-        const res = await fetch(apiUrl, { 
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Node-IP-Checker/1.0)' }, 
-            cf: { cacheTtl: 3600, cacheEverything: true },
-            signal: controller.signal 
-        });
-        clearTimeout(timeoutId);
-        
-        const data = await res.json();
-        let code = 'UN';
-        if (data.country) code = data.country; 
-        else if (data.countryCode) code = data.countryCode; 
-        return code;
-    } catch (e) {
-        clearTimeout(timeoutId); 
-        if (e.name === 'AbortError') return 'TIMEOUT'; 
-        if (retry < 1) return await queryExternalAPI(ip, port, retry + 1); 
-        return 'ERR';
+    if(env.TG_BOT_TOKEN) {
+        await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ chat_id: chatId, text: text }) });
     }
 }
 
-async function handleUpload(request, env) {
-    const formData = await request.formData();
-    const file = formData.get('file');
-    if (!file || !(file instanceof File)) return new Response(JSON.stringify({ error: '无效文件' }), { status: 400 });
-    
-    let text = await file.text();
-    try {
-        const buffer = await file.arrayBuffer();
-        const decoder = new TextDecoder('gbk');
-        const gbkText = decoder.decode(buffer);
-        if (/[\u4e00-\u9fa5]/.test(gbkText) && !/[\u4e00-\u9fa5]/.test(text)) {
-            text = gbkText;
-        }
-    } catch (e) {}
-
-    const cleanNodes = IPExtractor.processBatch(text);
-    if (cleanNodes.length === 0) return new Response(JSON.stringify({ error: '文件中未找到有效的IP节点' }), { status: 400 });
-    
-    const content = cleanNodes.map(n => {
-        const base = n.port ? `${n.ip}:${n.port}` : n.ip;
-        return n.remark ? `${base}#${n.remark}` : base; 
-    }).join('\n');
-    
-    let fileName = file.name;
-    let fileList = await env[KV_BINDING_NAME].get('uploaded_files', { type: 'json' }) || [];
-    if (fileList.includes(fileName)) {
-        const parts = fileName.split('.');
-        const ext = parts.length > 1 ? '.' + parts.pop() : '';
-        const base = parts.join('.');
-        fileName = `${base}_${Math.floor(1000 + Math.random() * 9000)}${ext}`;
-    }
-    await env[KV_BINDING_NAME].put(`file_content_${fileName}`, content);
-    fileList.push(fileName);
-    await env[KV_BINDING_NAME].put('uploaded_files', JSON.stringify(fileList));
-    return new Response(JSON.stringify({ success: true, fileName, count: cleanNodes.length }));
-}
-
-// 修复：删除上传文件函数
-async function deleteUploadedFile(req, env) {
-    const b = await req.json();
-    let fileList = await env[KV_BINDING_NAME].get('uploaded_files', { type: 'json' }) || [];
-    const idx = fileList.indexOf(b.fileName);
-    if (idx !== -1) {
-        fileList.splice(idx, 1);
-        await env[KV_BINDING_NAME].put('uploaded_files', JSON.stringify(fileList));
-        await env[KV_BINDING_NAME].delete(`file_content_${b.fileName}`);
-        // 修复：确保删除操作完成后返回成功状态
-        return new Response(JSON.stringify({ success: true, fileName: b.fileName }));
-    }
-    return new Response(JSON.stringify({ error: 'File not found' }), { status: 404 });
-}
-
-// 【v9.9】源解析逻辑兼容对象
-async function performExtraction(env, sources) {
+// ==========================================
+// 8. 修复版提取逻辑 (支持可编辑文件+Base64增强)
+// ==========================================
+async function performExtraction(env, sources, forceRefresh = false) {
   let nodeMap = new Map();
-  // 兼容旧数据（字符串）和新数据（对象）
-  const urls = (await env[KV_BINDING_NAME].get('urls', { type: 'json' }) || []).map(x => typeof x === 'string' ? {url:x} : x);
-  const apis = (await env[KV_BINDING_NAME].get('apis', { type: 'json' }) || []).map(x => typeof x === 'string' ? {url:x} : x);
-  
-  const custom = await env[KV_BINDING_NAME].get('custom_ips', { type: 'json' }) || [];
-  const uploadedFiles = await env[KV_BINDING_NAME].get('uploaded_files', { type: 'json' }) || [];
+  const [urls, apis, custom, uploadedFiles] = await Promise.all([
+      DataAccessLayer.readConfig(env, 'urls', [], forceRefresh),
+      DataAccessLayer.readConfig(env, 'apis', [], forceRefresh),
+      DataAccessLayer.readConfig(env, 'custom_ips', [], forceRefresh),
+      DataAccessLayer.readConfig(env, 'uploaded_files', [], forceRefresh)
+  ]);
   let allCandidates = [];
-
   if (sources.includeCustom) IPExtractor.processBatch(custom).forEach(r => allCandidates.push({...r, source: 'custom'}));
   
   if (sources.files && Array.isArray(sources.files)) {
       const filePromises = sources.files.map(async (fileName) => {
+          // 1. 先检查是否为上传文件
           if (uploadedFiles.includes(fileName)) {
-              const content = await env[KV_BINDING_NAME].get(`file_content_${fileName}`);
+              const content = await DataAccessLayer.readFile(env, 'upload', fileName);
               if (content) return IPExtractor.processBatch(content).map(r => ({...r, source: 'file'}));
+          } 
+          // 2. 再检查是否为可编辑文件
+          else {
+              try {
+                  const editableData = await DataAccessLayer.getEditableFile(env, fileName);
+                  if (editableData && editableData.ips && Array.isArray(editableData.ips)) {
+                      return editableData.ips.map(r => ({...r, source: 'editable'}));
+                  }
+              } catch(e) {}
           }
           return [];
       });
       (await Promise.all(filePromises)).forEach(r => allCandidates.push(...r));
   }
   
+  const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   const apiPromises = (sources.apis || []).map(async (i) => {
       const item = apis[i];
-      if (item && item.url) try { 
-          const c = new AbortController();
-          const id = setTimeout(() => c.abort(), 5000);
-          const t = await (await fetch(item.url, { signal: c.signal })).text(); 
-          clearTimeout(id);
-          return IPExtractor.processBatch(t).map(r => ({...r, source: 'api'})); 
-      } catch (e) { return []; } return [];
+      if(item && item.url) {
+          try {
+             const c = new AbortController(); const id = setTimeout(() => c.abort(), 15000); 
+             const res = await fetch(item.url, { signal: c.signal, headers: { 'Cache-Control': 'no-store', 'User-Agent': BROWSER_UA } }); 
+             const txt = await res.text(); clearTimeout(id);
+             return IPExtractor.processBatch(txt).map(r => ({...r, source: 'api'})); 
+          } catch(e) { return []; }
+      }
+      return [];
   });
-  (await Promise.all(apiPromises)).forEach(r => allCandidates.push(...r));
-  
+  (await Promise.all(apiPromises)).forEach(r => r.forEach(x => allCandidates.push(x)));
   const urlPromises = (sources.urls || []).map(async (i) => {
       const item = urls[i];
-      if (item && item.url) try { 
-          const c = new AbortController();
-          const id = setTimeout(() => c.abort(), 5000);
-          const res = await fetch(item.url, { headers: { 'User-Agent': 'v2rayN/1.0' }, signal: c.signal });
-          const txt = await res.text();
-          clearTimeout(id);
-          return parseSubscription(txt).map(r => ({...r, source: 'sub'})); 
-      } catch (e) { return []; } return [];
+      if(item && item.url) {
+         try {
+            const c = new AbortController(); const id = setTimeout(() => c.abort(), 15000); 
+            const res = await fetch(item.url, { headers: { 'User-Agent': BROWSER_UA, 'Cache-Control': 'no-store', 'Accept': 'text/plain,application/json,text/html,*/*' }, signal: c.signal }); 
+            const txt = await res.text(); clearTimeout(id);
+            return parseSubscription(txt).map(r => ({...r, source: 'sub'})); 
+         } catch(e) { return []; }
+      }
+      return [];
   });
-  (await Promise.all(urlPromises)).forEach(r => allCandidates.push(...r));
+  (await Promise.all(urlPromises)).forEach(r => r.forEach(x => allCandidates.push(x)));
 
-  const processedNodes = [];
-  const pendingNodes = [];
-  
   for (const node of allCandidates) {
-      const safePort = node.port || "443";
-      if (node.remark && node.remark.trim() !== "") {
-          processedNodes.push({ ip: node.ip, port: safePort, remark: node.remark });
-      } else {
-          pendingNodes.push({ ip: node.ip, port: safePort });
+      const key = `${node.ip}:${node.port || 443}`;
+      if (!nodeMap.has(key)) nodeMap.set(key, node.remark || ''); 
+      else { const old = nodeMap.get(key); if (old === 'ERR' || old === 'UN' || old === 'TIMEOUT' || (!old && node.remark)) nodeMap.set(key, node.remark || ''); }
+  }
+
+  const tasks = [];
+  for (let [key, remark] of nodeMap) { if (!remark) { const [ip, port] = key.split(':'); tasks.push({ key, ip, port }); } }
+
+  const MAX_QUERY = 200; 
+  const BATCH_SIZE = 15; 
+  if (tasks.length > 0) {
+      const processTasks = tasks.slice(0, MAX_QUERY); 
+      for (let i = 0; i < processTasks.length; i += BATCH_SIZE) {
+          const batch = processTasks.slice(i, i + BATCH_SIZE);
+          await Promise.all(batch.map(async (task) => {
+              const code = await queryExternalAPI(task.ip, task.port);
+              if (code && code !== 'ERR' && code !== 'TIMEOUT') nodeMap.set(task.key, code);
+          }));
       }
   }
-
-  const BATCH_SIZE = 15;
-  for (let i = 0; i < pendingNodes.length; i += BATCH_SIZE) {
-      const batch = pendingNodes.slice(i, i + BATCH_SIZE);
-      const results = await Promise.all(batch.map(async (node) => {
-          const country = await queryExternalAPI(node.ip, node.port);
-          return { ip: node.ip, port: node.port, remark: country };
-      }));
-      processedNodes.push(...results);
-  }
-
-  for (const node of processedNodes) {
-      const key = `${node.ip}:${node.port}`;
-      if (!nodeMap.has(key)) nodeMap.set(key, node.remark);
-      else {
-          const old = nodeMap.get(key);
-          if (old === 'ERR' || old === 'UN' || old === 'TIMEOUT' || (node.remark !== 'ERR' && node.remark.length > old.length)) nodeMap.set(key, node.remark);
-      }
-  }
-
   const result = [];
-  for (let [key, remark] of nodeMap) result.push(`${key}#${remark}`);
+  for (let [key, remark] of nodeMap) result.push(remark ? `${key}#${remark}` : key);
   return result;
 }
 
+// 修复: 增强版订阅解析 (支持 URL-Safe Base64)
 function parseSubscription(c) {
   const n = []; let d = c;
-  try { if (!c.includes(' ') && c.length > 50) d = atob(c.trim().replace(/\s/g, '')); } catch (e) {}
+  try {
+      // 1. 去除所有空格
+      let cleanStr = c.replace(/\s/g, '');
+      
+      // 2. 只有当字符串看起来像Base64且不是明文URL时才尝试解码
+      if (cleanStr.length > 20 && !cleanStr.includes('://')) {
+          // 3. 处理 URL-Safe Base64 (- -> +, _ -> /)
+          cleanStr = cleanStr.replace(/-/g, '+').replace(/_/g, '/');
+          
+          // 4. 补全 Padding
+          while (cleanStr.length % 4) {
+              cleanStr += '=';
+          }
+          
+          // 5. 解码 (使用 decodeURIComponent + escape 处理 UTF-8)
+          d = decodeURIComponent(escape(atob(cleanStr)));
+      }
+  } catch (e) {
+      // 如果解码失败，假定原文就是明文列表，继续处理
+      d = c;
+  }
+
   d.split(/[\r\n]+/).forEach(l => {
     const t = l.trim(); if (!t) return;
-    if (t.startsWith('vmess://')) { try { const j = JSON.parse(atob(t.substring(8))); if (IPExtractor.isValidIP(j.add)) n.push({ ip: j.add, port: j.port, remark: j.ps }); return; } catch (e) {} }
-    if (t.match(/^(vless|trojan|ss):\/\//)) { try { const u = new URL(t); if (IPExtractor.isValidIP(u.hostname)) n.push({ ip: u.hostname, port: u.port, remark: u.hash ? decodeURIComponent(u.hash.substring(1)) : '' }); return; } catch(e) {} }
+    
+    // VMESS
+    if (t.startsWith('vmess://')) { 
+        try { 
+            let base64 = t.substring(8); 
+            // 同样处理 vmess 内的 base64
+            base64 = base64.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/');
+            const jsonStr = decodeURIComponent(escape(atob(base64))); 
+            const j = JSON.parse(jsonStr); 
+            if (IPExtractor.isValidIP(j.add)) n.push({ ip: j.add, port: j.port, remark: j.ps }); 
+            return; 
+        } catch (e) {} 
+    }
+    
+    // VLESS/TROJAN/SS
+    if (t.match(/^(vless|trojan|ss):\/\//)) { 
+        try { 
+            const u = new URL(t); 
+            if (IPExtractor.isValidIP(u.hostname)) n.push({ ip: u.hostname, port: u.port, remark: u.hash ? decodeURIComponent(u.hash.substring(1)) : '' }); 
+            return; 
+        } catch(e) {} 
+    }
+    
+    // 纯文本 IP
     const processed = IPExtractor.processBatch([t]);
     if (processed.length > 0) n.push(processed[0]);
   });
   return n;
 }
 
-async function handleToolQuery(request) {
-    const { ipList } = await request.json();
-    if (!ipList || !Array.isArray(ipList)) throw new Error('无效的IP列表');
-    const items = IPExtractor.processBatch(ipList);
-    if (items.length > 200) throw new Error('一次最多查询200个IP');
-    
-    const processedNodes = [];
-    const pendingNodes = items; 
-    
-    const BATCH_SIZE = 15;
-    for (let i = 0; i < pendingNodes.length; i += BATCH_SIZE) {
-        const batch = pendingNodes.slice(i, i + BATCH_SIZE);
-        const results = await Promise.all(batch.map(async (item) => {
-            const code = await queryExternalAPI(item.ip, item.port);
-            return { ...item, remark: code };
-        }));
-        processedNodes.push(...results);
-    }
-
-    const finalResults = processedNodes.map(item => {
-        const fmt = item.port ? `${item.ip}:${item.port}#${item.remark}` : `${item.ip}#${item.remark}`;
-        return { formatted: fmt, success: item.remark !== 'ERR' && item.remark !== 'TIMEOUT' };
-    });
-
-    return new Response(JSON.stringify({ results: finalResults }), { headers: { 'Content-Type': 'application/json' } });
-}
-
-// 站点 CRUD
-async function getSites(env) { return new Response(JSON.stringify(await env[KV_BINDING_NAME].get('sites_list', { type: 'json' }) || [])); }
-async function addSite(req, env) {
-    const b = await req.json(); 
-    let l = await env[KV_BINDING_NAME].get('sites_list', { type: 'json' }) || [];
-    l.push(b);
-    await env[KV_BINDING_NAME].put('sites_list', JSON.stringify(l));
-    return new Response(JSON.stringify({ success: true }));
-}
-// 修复：删除站点函数
-async function deleteSite(req, env) {
-    const b = await req.json(); 
-    let l = await env[KV_BINDING_NAME].get('sites_list', { type: 'json' }) || [];
-    if(b.index >= 0) { 
-        l.splice(b.index, 1); 
-        await env[KV_BINDING_NAME].put('sites_list', JSON.stringify(l)); 
-        // 修复：确保删除操作完成后返回成功状态
-        return new Response(JSON.stringify({ success: true, index: b.index })); 
-    }
-    return new Response(JSON.stringify({ error: 'Invalid index' }), { status: 400 });
-}
-
-// 通用CRUD
-async function getList(env, key) { 
-    // 【v9.9】读取时如果不兼容旧数据（纯字符串），不会崩，但前端显示需处理
-    return new Response(JSON.stringify(await env[KV_BINDING_NAME].get(key, { type: 'json' }) || [])); 
-}
-async function addItem(req, env, act) {
-  const b = await req.json(); // {name, url} for apis/urls
-  const k = act === 'custom' ? 'ips' : act; 
-  let list = [];
-  if(act === 'custom') list = b.ips || [];
-  else list = b.items || []; // items = [{name,url}]
-
-  if(act !== 'custom') { 
-      let old = await env[KV_BINDING_NAME].get(act, {type:'json'}) || [];
-      // 兼容：如果旧数据是字符串数组，转对象
-      old = old.map(x => typeof x === 'string' ? {name:'', url:x} : x);
-      list = [...old, ...list];
-  }
-  await env[KV_BINDING_NAME].put(act === 'custom' ? 'custom_ips' : act, JSON.stringify(list));
-  return new Response(JSON.stringify({success:true}));
-}
-// 修复：删除项目函数
-async function deleteItem(req, env, key) {
-  const b = await req.json(); 
-  let l = await env[KV_BINDING_NAME].get(key, { type: 'json' }) || [];
-  if (b.index >= 0) { 
-    l.splice(b.index, 1); 
-    await env[KV_BINDING_NAME].put(key, JSON.stringify(l)); 
-    // 修复：确保删除操作完成后返回成功状态
-    return new Response(JSON.stringify({ success: true, index: b.index })); 
-  }
-  return new Response(JSON.stringify({ error: 'Invalid index' }), { status: 400 });
-}
-async function getIPFiles(env) {
-  const l = await env[KV_BINDING_NAME].list({ prefix: 'ip_file_meta_' }); const f = [];
-  for (const k of l.keys) {
-    const m = await env[KV_BINDING_NAME].get(k.name, { type: 'json' });
-    const s = await env[KV_BINDING_NAME].get(`ip_stats_${m.name}`, { type: 'json' }) || { total: 0, today: 0, lastAccess: null };
-    if (m) f.push({...m, stats: s});
-  }
-  return new Response(JSON.stringify(f));
-}
-async function saveIPFile(req, env) {
-  const b = await req.json(); 
-  const r = await performExtraction(env, b.sources);
-  const meta = { name: b.fileName, sources: b.sources, autoUpdate: b.autoUpdate, lastUpdate: new Date().toISOString() };
-  await env[KV_BINDING_NAME].put(`ip_file_${b.fileName}`, JSON.stringify({ content: r.join('\n'), lastUpdate: new Date().toISOString() }));
-  await env[KV_BINDING_NAME].put(`ip_file_meta_${b.fileName}`, JSON.stringify(meta));
-  // 初始化统计
-  await env[KV_BINDING_NAME].put(`ip_stats_${b.fileName}`, JSON.stringify({ total: 0, today: 0, lastAccess: null }));
-  return new Response(JSON.stringify({ success: true, count: r.length, meta: meta }));
-}
-// 修复：删除IP文件函数
-async function deleteIPFile(req, env) {
-  const n = new URL(req.url).searchParams.get('name');
-  if (!n) {
-    return new Response(JSON.stringify({ error: 'File name is required' }), { status: 400 });
-  }
-  
-  await env[KV_BINDING_NAME].delete(`ip_file_${n}`); 
-  await env[KV_BINDING_NAME].delete(`ip_file_meta_${n}`); 
-  await env[KV_BINDING_NAME].delete(`ip_stats_${n}`);
-  // 修复：确保删除操作完成后返回成功状态
-  return new Response(JSON.stringify({ success: true, fileName: n }));
-}
-async function updateIPFile(req, env) {
-  const b = await req.json(); 
-  const m = await env[KV_BINDING_NAME].get(`ip_file_meta_${b.fileName}`, { type: 'json' }); if(!m) throw new Error('Not found');
-  const r = await performExtraction(env, m.sources);
-  await env[KV_BINDING_NAME].put(`ip_file_${b.fileName}`, JSON.stringify({ content: r.join('\n'), lastUpdate: new Date().toISOString() }));
-  m.lastUpdate = new Date().toISOString(); 
-  await env[KV_BINDING_NAME].put(`ip_file_meta_${b.fileName}`, JSON.stringify(m));
-  return new Response(JSON.stringify({ success: true, count: r.length, meta: m }));
-}
-
-// 新增编辑文件数据源功能
-async function editIPFileSources(req, env) {
-  const b = await req.json(); 
-  const { fileName, sources, autoUpdate } = b;
-  
-  if (!fileName) throw new Error('文件名不能为空');
-  
-  const meta = await env[KV_BINDING_NAME].get(`ip_file_meta_${fileName}`, { type: 'json' });
-  if (!meta) throw new Error('文件不存在');
-  
-  // 更新数据源配置和自动更新设置
-  const updatedMeta = {
-    ...meta,
-    sources: sources,
-    autoUpdate: autoUpdate !== undefined ? autoUpdate : meta.autoUpdate,
-    lastUpdate: new Date().toISOString()
-  };
-  
-  // 重新生成文件内容
-  const r = await performExtraction(env, sources);
-  await env[KV_BINDING_NAME].put(`ip_file_${fileName}`, JSON.stringify({ 
-    content: r.join('\n'), 
-    lastUpdate: new Date().toISOString() 
-  }));
-  
-  await env[KV_BINDING_NAME].put(`ip_file_meta_${fileName}`, JSON.stringify(updatedMeta));
-  
-  return new Response(JSON.stringify({ 
-    success: true, 
-    count: r.length,
-    meta: updatedMeta 
-  }));
-}
-
-// 修复：重置统计功能
-async function resetFileStats(req, env) {
-  const { fileName } = await req.json();
-  if (!fileName) throw new Error('文件名不能为空');
-  
-  await env[KV_BINDING_NAME].put(`ip_stats_${fileName}`, JSON.stringify({ 
-    total: 0, 
-    today: 0, 
-    lastAccess: null 
-  }));
-  
-  return new Response(JSON.stringify({ success: true }));
+async function queryExternalAPI(ip, port, retry = 0) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    try {
+        const apiUrl = retry > 0 ? `http://ip-api.com/json/${ip}?fields=countryCode` : `https://ipinfo.io/${ip}/json`;
+        const res = await fetch(apiUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Node-IP-Checker/1.0)' }, cf: { cacheTtl: 3600, cacheEverything: true }, signal: controller.signal });
+        clearTimeout(timeoutId);
+        const data = await res.json();
+        let code = 'UN';
+        if (data.country) code = data.country; else if (data.countryCode) code = data.countryCode; 
+        return code;
+    } catch (e) { clearTimeout(timeoutId); if (e.name === 'AbortError') return 'TIMEOUT'; if (retry < 1) return await queryExternalAPI(ip, port, retry + 1); return 'ERR'; }
 }
 
 async function extractIPs(req, env) { const b = await req.json(); const r = await performExtraction(env, b.sources); return new Response(JSON.stringify({ ips: r, count: r.length })); }
+
+async function handleToolQuery(request) {
+    const { ipList, deduplicate } = await request.json();
+    if (!ipList || !Array.isArray(ipList)) throw new Error('无效的IP列表');
+    let items = IPExtractor.processBatch(ipList);
+    if (deduplicate) items = IPExtractor.deduplicateIPs(items);
+    if (items.length > 200) throw new Error('一次最多查询200个IP');
+    const processedNodes = [];
+    const pendingNodes = items; 
+    const BATCH_SIZE = 15;
+    for (let i = 0; i < pendingNodes.length; i += BATCH_SIZE) {
+        const batch = pendingNodes.slice(i, i + BATCH_SIZE);
+        const results = await Promise.all(batch.map(async (item) => { const code = await queryExternalAPI(item.ip, item.port); return { ...item, remark: code }; }));
+        processedNodes.push(...results);
+    }
+    const finalResults = processedNodes.map(item => { const fmt = item.port ? `${item.ip}:${item.port}#${item.remark}` : `${item.ip}#${item.remark}`; return { formatted: fmt, success: item.remark !== 'ERR' && item.remark !== 'TIMEOUT' }; });
+    return new Response(JSON.stringify({ results: finalResults }), { headers: { 'Content-Type': 'application/json' } });
+}
+
 async function logout(req, env) { const c = req.headers.get('Cookie'); if(c) { const id = c.split('session=')[1]?.split(';')[0]; if(id) await env[KV_BINDING_NAME].delete(`session_${id}`); } return new Response(null, { status: 302, headers: { 'Set-Cookie': 'session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0', 'Location': '/admin' } }); }
+
 async function checkSession(req, env) { const c = req.headers.get('Cookie'); if(!c) return false; const id = c.match(/session=([^;]+)/)?.[1]; if(!id) return false; return await env[KV_BINDING_NAME].get(`session_${id}`) === 'valid'; }
 
 // ==========================================
-// 4. 页面处理
+// 10. 管理页面 (修复版: 强制禁用缓存)
 // ==========================================
-// 修复：格式化时间为北京时间
-function formatBeijingTime(isoString) {
-    if (!isoString) return '--';
-    // 直接解析ISO字符串，然后使用Asia/Shanghai时区格式化
-    const date = new Date(isoString);
-    return date.toLocaleString('zh-CN', {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-        timeZone: 'Asia/Shanghai' // 直接使用时区转换，不需要手动偏移
-    });
-}
-
-async function handleIPFile(request, env, ctx, path) {
-  const fileName = path.replace('/ip/', '').replace(/^\//, '');
-  const kvKey = `ip_file_${fileName}`;
-  const statsKey = `ip_stats_${fileName}`;
-  
-  try {
-    const fileData = await env[KV_BINDING_NAME].get(kvKey, { type: 'json' });
-    if (!fileData) return new Response('IP file not found', { status: 404 });
-    
-    // 修复：每次访问都更新统计，使用北京时间
-    ctx.waitUntil((async () => {
-        try {
-            let stats = await env[KV_BINDING_NAME].get(statsKey, { type: 'json' }) || { total: 0, today: 0, lastAccess: null };
-            
-            // 获取当前北京时间
-            const now = new Date();
-            const beijingTime = new Date(now.toLocaleString("en-US", {timeZone: "Asia/Shanghai"}));
-            const todayStr = beijingTime.toISOString().split('T')[0];
-            
-            // 检查是否是新的一天（使用北京时间）
-            if (stats.date !== todayStr) {
-                stats.date = todayStr;
-                stats.today = 0;
-            }
-            
-            // 更新统计
-            stats.total = (stats.total || 0) + 1; 
-            stats.today = (stats.today || 0) + 1;
-            // 修复：存储UTC时间，显示时再转换为北京时间
-            stats.lastAccess = now.toISOString(); // 存储标准UTC时间
-            
-            await env[KV_BINDING_NAME].put(statsKey, JSON.stringify(stats));
-        } catch(e) {
-            console.error('Stats update error:', e);
-        }
-    })());
-    
-    return new Response(fileData.content, { 
-      headers: { 
-        'Content-Type': 'text/plain; charset=utf-8', 
-        'Access-Control-Allow-Origin': '*'
-      } 
-    });
-  } catch (error) { 
-    console.error('File serving error:', error);
-    return new Response('Error', { status: 500 }); 
-  }
-}
-
-async function handleCronJob(env) {
-  const kv = env[KV_BINDING_NAME];
-  try {
-    const list = await kv.list({ prefix: 'ip_file_meta_' });
-    for (const key of list.keys) {
-      const meta = await kv.get(key.name, { type: 'json' });
-      if (meta && meta.autoUpdate) {
-        const r = await performExtraction(env, meta.sources);
-        await kv.put(`ip_file_${meta.name}`, JSON.stringify({ content: r.join('\n'), lastUpdate: new Date().toISOString() }));
-        meta.lastUpdate = new Date().toISOString(); await kv.put(key.name, JSON.stringify(meta));
-      }
-    }
-  } catch (e) { console.error("Cron job failed:", e); }
-}
-
 async function handleAdmin(req, env) {
-  const url = new URL(req.url); const sess = await checkSession(req, env);
+  const url = new URL(req.url); 
+  const sess = await checkSession(req, env);
   if (!sess && url.searchParams.get('action') !== 'login') return new Response(getLoginPage(), { headers: { 'Content-Type': 'text/html; charset=utf-8' }});
   if (url.searchParams.get('action') === 'login') {
     const fd = await req.formData();
     if (fd.get('password') === env.ADMIN_PASSWORD) {
-      const id = crypto.randomUUID(); await env[KV_BINDING_NAME].put(`session_${id}`, 'valid', { expirationTtl: 86400 });
+      const id = crypto.randomUUID(); 
+      await env[KV_BINDING_NAME].put(`session_${id}`, 'valid', { expirationTtl: 86400 });
       return new Response('', { status: 302, headers: { 'Set-Cookie': `session=${id}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400`, 'Location': '/admin' } });
     }
     return new Response(getLoginPage('密码错误'), { headers: { 'Content-Type': 'text/html; charset=utf-8' }});
   }
-  const [urls, apis, customIPs, uploadedFiles, ipFilesRaw, sitesList] = await Promise.all([
-      env[KV_BINDING_NAME].get('urls', {type:'json'})||[],
-      env[KV_BINDING_NAME].get('apis', {type:'json'})||[],
-      env[KV_BINDING_NAME].get('custom_ips', {type:'json'})||[],
-      env[KV_BINDING_NAME].get('uploaded_files', {type:'json'})||[],
-      env[KV_BINDING_NAME].list({prefix:'ip_file_meta_'}),
-      env[KV_BINDING_NAME].get('sites_list', {type:'json'})||[]
+  const [urls, apis, customIPs, uploadedFiles, sitesList, manifest] = await Promise.all([
+      DataAccessLayer.readConfig(env, 'urls'),
+      DataAccessLayer.readConfig(env, 'apis'),
+      DataAccessLayer.readConfig(env, 'custom_ips'),
+      DataAccessLayer.readConfig(env, 'uploaded_files'),
+      DataAccessLayer.readConfig(env, 'sites_list'),
+      DataAccessLayer.getManifest(env)
   ]);
   const ipFiles = [];
-  for (const k of ipFilesRaw.keys) {
-      const m = await env[KV_BINDING_NAME].get(k.name, {type:'json'});
-      const s = await env[KV_BINDING_NAME].get(`ip_stats_${m.name}`, {type:'json'}) || {total:0, today:0, lastAccess:null};
-      if(m) ipFiles.push({...m, stats: s});
+  const editableFiles = [];
+  for (const [name, meta] of Object.entries(manifest)) {
+      if(!meta) continue;
+      const stats = await DataAccessLayer.getStats(env, name);
+      if (meta.editable) {
+        try {
+            const editableData = await DataAccessLayer.getEditableFile(env, name);
+            editableFiles.push({ ...meta, stats, ips: editableData ? editableData.ips : [] });
+        } catch(e) {
+            // 防止读取错误导致页面渲染失败，填充空数据
+            editableFiles.push({ ...meta, stats, ips: [] });
+        }
+      } else { ipFiles.push({ ...meta, stats }); }
   }
-  const jsonStr = JSON.stringify({ urls, apis, customIPs, uploadedFiles, ipFiles, sitesList });
+  const jsonStr = JSON.stringify({ urls, apis, customIPs, uploadedFiles, ipFiles, editableFiles, sitesList });
   const base64Data = btoa(unescape(encodeURIComponent(jsonStr)));
-  return new Response(getAdminPage(base64Data, url.origin), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  
+  // 关键修复: 添加 Cache-Control 禁止浏览器缓存管理页面，解决刷新后列表回退问题
+  return new Response(getAdminPage(base64Data, url.origin), { 
+      headers: { 
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0'
+      } 
+  });
 }
 
 function getLoginPage(error = '') {
-    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>系统登录</title><style>:root{--primary:#6366f1;--bg:#f3f4f6;--surface:#ffffff;--text:#1f2937}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.login-box{background:var(--surface);padding:2.5rem;border-radius:1rem;box-shadow:0 10px 25px -5px rgba(0,0,0,0.1);width:100%;max-width:360px;text-align:center}h2{margin-bottom:1.5rem;color:var(--text);font-weight:700}input{width:100%;padding:.75rem 1rem;margin-bottom:1rem;border:1px solid #e5e7eb;border-radius:.5rem;font-size:1rem;box-sizing:border-box;outline:none;transition:all .2s}input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,0.2)}button{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.5rem;font-size:1rem;font-weight:600;cursor:pointer;transition:background .2s}button:hover{background:#4f46e5}.error{background:#fee2e2;color:#991b1b;padding:.75rem;border-radius:.5rem;margin-top:1rem;font-size:.875rem}</style></head><body><div class="login-box"><h2>🔒 节点管理系统</h2><form method="POST" action="/admin?action=login"><input type="password" name="password" placeholder="请输入访问密码" required autofocus><button type="submit">立即登录</button>${error?`<div class="error">${error}</div>`:''}</form></div></body></html>`;
+    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>系统登录</title><style>:root{--primary:#6366f1;--bg:#f3f4f6;--surface:#ffffff;--text:#1f2937}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.login-box{background:var(--surface);padding:2.5rem;border-radius:1rem;box-shadow:0 10px 25px -5px rgba(0,0,0,0.1);width:100%;max-width:360px;text-align:center}h2{margin-bottom:1.5rem;color:var(--text);font-weight:700}input{width:100%;padding:.75rem 1rem;margin-bottom:1rem;border:1px solid #e5e7eb;border-radius:.5rem;font-size:1rem;box-sizing:border-box;outline:none;transition:all .2s}input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,0.2)}button{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.5rem;font-size:1rem;font-weight:600;cursor:pointer;transition:background .2s}button:hover{background:#4f46e5}.error{background:#fee2e2;color:#991b1b;padding:.75rem;border-radius:.5rem;margin-top:1rem;font-size:.875rem}</style></head><body><div class="login-box"><h2>🔒 节点管理系统 v10.7</h2><form method="POST" action="?action=login"><input type="password" name="password" placeholder="请输入访问密码" required autofocus><button type="submit">立即登录</button>${error?`<div class="error">${error}</div>`:''}</form></div></body></html>`;
 }
 
 function getAdminPage(base64Data, origin) {
+    const originVar = origin;
+    const base64Var = base64Data;
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>节点 IP 管理控制台 v9.9.4</title>
+<title>节点 IP 管理控制台 v10.7 (Base64修复版)</title>
 <style>
     :root { --primary: #4f46e5; --primary-hover: #4338ca; --danger: #ef4444; --danger-hover: #dc2626; --success: #10b981; --warning: #f59e0b; --bg: #f3f4f6; --surface: #ffffff; --text-main: #111827; --text-sub: #6b7280; --border: #e5e7eb; --radius: 0.75rem; }
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -802,6 +951,7 @@ function getAdminPage(base64Data, origin) {
     .item-meta { font-size: 0.75rem; color: var(--text-sub); margin-top: 4px; display: flex; gap: 10px; align-items: center;}
     .badge { padding: 2px 8px; border-radius: 10px; background: #e5e7eb; font-size: 0.7rem; font-weight: 600; }
     .badge.auto { background: #d1fae5; color: #065f46; }
+    .badge.editable { background: #ddd6fe; color: #5b21b6; }
     .src-badge { display: inline-block; padding: 2px 6px; margin: 2px; border-radius: 4px; font-size: 0.7rem; background: #e5e7eb; color: #4b5563; border: 1px solid #d1d5db; }
     .src-badge.custom { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
     .src-badge.file { background: #dbeafe; color: #1e40af; border-color: #bfdbfe; }
@@ -824,7 +974,6 @@ function getAdminPage(base64Data, origin) {
     .tools-sidebar { background: #f9fafb; padding: 1.5rem; border-radius: var(--radius); border: 1px solid var(--border); }
     .link-card { display: block; padding: 10px; margin-bottom: 8px; background: white; border: 1px solid var(--border); border-radius: 6px; text-decoration: none; color: var(--text-main); font-size: 0.9rem; display: flex; align-items: center; transition: all 0.2s; }
     .link-card:hover { border-color: var(--primary); color: var(--primary); transform: translateX(3px); }
-    /* 编辑数据源模态框样式 */
     .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); z-index: 1000; }
     .modal-content { background-color: var(--surface); margin: 5% auto; padding: 2rem; border-radius: var(--radius); width: 90%; max-width: 800px; max-height: 80vh; overflow-y: auto; }
     .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
@@ -837,6 +986,14 @@ function getAdminPage(base64Data, origin) {
     .edit-section h3 { font-size: 1rem; margin-bottom: 0.8rem; color: var(--text-main); border-left: 3px solid var(--primary); padding-left: 8px; }
     .stats-info { display: flex; gap: 15px; align-items: center; font-size: 0.8rem; color: var(--text-sub); }
     .stats-info span { display: flex; align-items: center; gap: 4px; }
+    .editable-ip-list { max-height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.5rem; margin-bottom: 1rem; }
+    .editable-ip-item { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem; margin-bottom: 0.5rem; background: #f9fafb; border-radius: 0.3rem; }
+    .editable-ip-item:hover { background: #f3f4f6; }
+    .editable-ip-text { font-family: monospace; font-size: 0.85rem; flex: 1; margin-right: 0.5rem; }
+    .editable-ip-actions { display: flex; gap: 0.5rem; }
+    .btn-small { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+    .ip-add-form { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+    .ip-add-actions { display: flex; gap: 10px; margin-top: 5px; }
     @media (max-width: 800px) { .tools-layout { grid-template-columns: 1fr; } }
     @media (max-width: 640px) { .container { padding: 0 0.5rem; } .tab { padding: 0.5rem 1rem; font-size: 0.85rem; } .tab-content { padding: 1.5rem 1rem; } .item { flex-direction: column; align-items: flex-start; gap: 10px; } .item button { width: 100%; } }
 </style>
@@ -844,7 +1001,7 @@ function getAdminPage(base64Data, origin) {
 <body>
 <div class="container">
     <header>
-        <h1>⚡️ 节点管理控制台 v9.9.4</h1>
+        <h1>⚡️ 节点管理控制台 v10.7 (Base64修复版)</h1>
         <a href="/api/logout" class="logout"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg> 退出</a>
     </header>
     <div id="message" class="message"></div>
@@ -853,6 +1010,7 @@ function getAdminPage(base64Data, origin) {
         <button class="tab active" data-tab="sources">🌐 IP来源</button>
         <button class="tab" data-tab="extract">🧪 提取测试</button>
         <button class="tab" data-tab="files">📂 文件生成</button>
+        <button class="tab" data-tab="editable">✏️ 可编辑文件</button>
         <button class="tab" data-tab="tools">🛠️ 查询工具</button>
     </nav>
 
@@ -953,581 +1111,709 @@ function getAdminPage(base64Data, origin) {
         <div class="item-list" id="file-list"></div>
     </div>
 
+    <div id="editable-tab" class="tab-content">
+        <h2>可编辑文件管理</h2>
+        <div style="background:#f0f9ff; padding:10px; border-radius:5px; margin-bottom:15px; font-size:0.85rem; color:#0369a1; border-left:4px solid #38bdf8;"><strong>提示：</strong> 可编辑文件现已作为"内部模块"使用。您可以在"生成订阅文件"中勾选它们作为数据源，组合成最终的订阅链接。</div>
+        <div class="item-list" id="editable-list"></div>
+        <div style="margin-top:2rem; text-align:center;">
+            <button id="btn-create-editable" class="btn-primary">➕ 创建新的可编辑文件</button>
+        </div>
+    </div>
+
     <div id="tools-tab" class="tab-content">
         <h2>IP 智能查询工具</h2>
         <div class="tools-layout">
             <div>
                 <div style="background:#fff3cd; color:#856404; padding:10px; border-radius:5px; margin-bottom:10px; font-size:0.85rem; border-left:4px solid #ffeeba;"><strong>提示：</strong> 此处查询会忽略已有备注，强制刷新 API 获取最新国家信息。</div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                        <input type="checkbox" id="tool-deduplicate" checked style="width:auto;margin:0"> 
+                        启用去重功能
+                    </label>
+                </div>
                 <div class="form-group"><textarea id="tool-input" rows="12" placeholder="粘贴 IP 列表..."></textarea></div>
                 <div style="display:flex; gap:10px">
                     <button id="btn-tool-run" class="btn-primary">🚀 开始查询</button>
                     <button id="btn-tool-copy" class="btn-success" style="display:none">📋 复制</button>
+                    <button id="btn-tool-save" class="btn-warning" style="display:none">💾 保存为可编辑文件</button>
                 </div>
                 <pre id="tool-output" style="display:none;"></pre>
             </div>
             <div class="tools-sidebar">
-                <h3 style="font-size:1rem; margin-bottom:1rem; border-left:3px solid var(--primary); padding-left:8px;">🔗 友情链接 / 工具</h3>
-                <div id="friend-links-list"></div>
-                <div style="margin-top:15px; border-top:1px solid #e5e7eb; padding-top:10px;">
-                     <input type="text" id="site-name-friend" placeholder="名称" style="width:100%;margin-bottom:5px;padding:5px;">
-                     <input type="text" id="site-url-friend" placeholder="链接" style="width:100%;margin-bottom:5px;padding:5px;">
-                     <button id="btn-add-site-friend" class="btn-secondary" style="width:100%;font-size:0.8rem;">+ 添加链接</button>
-                </div>
+            <h3 style="font-size:1rem; margin-bottom:1rem; border-left:3px solid var(--primary); padding-left:8px;">🔗 友情链接 / 工具</h3>
+            <div id="friend-links-list"></div>
+            <div style="margin-top:15px; border-top:1px solid #e5e7eb; padding-top:10px;">
+                 <input type="text" id="site-name-friend" placeholder="名称" style="width:100%;margin-bottom:5px;padding:5px;">
+                 <input type="text" id="site-url-friend" placeholder="链接" style="width:100%;margin-bottom:5px;padding:5px;">
+                 <button id="btn-add-site-friend" class="btn-secondary" style="width:100%;font-size:0.8rem;">+ 添加链接</button>
             </div>
         </div>
     </div>
 </div>
+</div>
 
-<!-- 编辑数据源模态框 -->
-<div id="edit-sources-modal" class="modal">
-    <div class="modal-content">
-        <div class="modal-header">
-            <h3 class="modal-title">编辑文件数据源</h3>
-            <span class="close">&times;</span>
+<div id="edit-file-modal" class="modal">
+<div class="modal-content">
+    <div class="modal-header">
+        <h3 class="modal-title">编辑可编辑文件</h3>
+        <span class="close">&times;</span>
+    </div>
+    <div class="modal-body">
+        <div class="edit-section">
+            <h3>文件名: <span id="edit-file-name" style="color: var(--primary);"></span></h3>
         </div>
-        <div class="modal-body">
-            <div class="edit-section">
-                <h3>文件名: <span id="edit-file-name" style="color: var(--primary);"></span></h3>
-            </div>
-            
-            <div class="edit-section">
-                <h3>自动更新</h3>
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-                    <input type="checkbox" id="edit-auto-update" style="width:auto;margin:0"> 启用自动更新
-                </label>
-            </div>
-            
-            <div class="edit-section">
-                <h3>数据源配置</h3>
-                <div style="display:flex; gap:10px; margin-bottom:10px;">
-                    <button id="edit-select-all" class="btn-primary" style="font-size:0.85rem; padding:0.5rem 1rem;">全选</button>
-                    <button id="edit-deselect-all" class="btn-danger" style="font-size:0.85rem; padding:0.5rem 1rem;">反选</button>
+        
+        <div class="edit-section">
+            <h3>批量编辑 / 添加 IP</h3>
+            <div class="ip-add-form">
+                <textarea id="batch-ip-input" rows="6" placeholder="在此处粘贴 IP 列表 (每行一个，格式: IP:端口#备注)"></textarea>
+                <div class="ip-add-actions">
+                    <button id="btn-batch-add" class="btn-success btn-small" style="flex:1">➕ 批量追加</button>
+                    <button id="btn-batch-replace" class="btn-warning btn-small" style="flex:1">🔄 覆盖导入</button>
+                    <button id="btn-clear-all" class="btn-danger btn-small" style="flex:1">🗑️ 一键清空</button>
                 </div>
-                <div id="edit-sources" class="checkbox-group"></div>
             </div>
-            
-            <div class="edit-section">
-                <h3>自定义IP</h3>
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-                    <input type="checkbox" id="edit-custom" style="width:auto;margin:0"> 包含自定义IP池
-                </label>
+            <div style="display:flex;justify-content:space-between;margin-bottom:5px;">
+                <h4 style="margin:0;font-size:0.9rem;">当前列表 (<span id="current-ip-count">0</span>)</h4>
+                <button id="btn-copy-list" class="btn-secondary btn-small" style="padding:2px 8px;">📋 复制列表</button>
             </div>
-        </div>
-        <div class="modal-footer">
-            <button id="btn-cancel-edit" class="btn-secondary">取消</button>
-            <button id="btn-save-edit-sources" class="btn-success">保存并重新生成</button>
+            <div class="editable-ip-list" id="editable-ip-list"></div>
         </div>
     </div>
+    <div class="modal-footer">
+        <button id="btn-cancel-edit" class="btn-secondary">取消</button>
+        <button id="btn-save-edit" class="btn-primary">保存更改</button>
+    </div>
+</div>
+</div>
+
+<div id="edit-sources-modal" class="modal">
+<div class="modal-content">
+    <div class="modal-header">
+        <h3 class="modal-title">编辑文件数据源</h3>
+        <span class="close">&times;</span>
+    </div>
+    <div class="modal-body">
+        <div class="edit-section">
+            <h3>文件名: <span id="edit-file-name" style="color: var(--primary);"></span></h3>
+        </div>
+        
+        <div class="edit-section">
+            <h3>自动更新</h3>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="edit-auto-update" style="width:auto;margin:0"> 启用自动更新
+            </label>
+        </div>
+        
+        <div class="edit-section">
+            <h3>数据源配置</h3>
+            <div style="display:flex; gap:10px; margin-bottom:10px;">
+                <button id="edit-select-all" class="btn-primary" style="font-size:0.85rem; padding:0.5rem 1rem;">全选</button>
+                <button id="edit-deselect-all" class="btn-danger" style="font-size:0.85rem; padding:0.5rem 1rem;">反选</button>
+            </div>
+            <div id="edit-sources" class="checkbox-group"></div>
+        </div>
+        
+        <div class="edit-section">
+            <h3>自定义IP</h3>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="edit-custom" style="width:auto;margin:0"> 包含自定义IP池
+            </label>
+        </div>
+    </div>
+    <div class="modal-footer">
+        <button id="btn-cancel-edit" class="btn-secondary">取消</button>
+        <button id="btn-save-edit-sources" class="btn-primary">保存并重新生成</button>
+    </div>
+</div>
 </div>
 
 <script>
 (function(){
-    let appData = {};
-    const currentOrigin = '${origin}';
-    let lastExtractResult = []; 
-    let currentEditingFile = null;
+let appData = {};
+const currentOrigin = '${originVar}';
+const base64Var = '${base64Var}';
+let lastExtractResult = []; 
+let currentEditingFile = null;
+let currentEditingIPs = [];
 
-    try { 
-        const raw = atob('${base64Data}');
-        appData = JSON.parse(decodeURIComponent(escape(raw))); 
-        
-        // 兼容旧数据格式：如果 url/apis 是纯字符串数组，转为对象
-        appData.urls = (appData.urls || []).map(u => typeof u === 'string' ? {name:'', url:u} : u);
-        appData.apis = (appData.apis || []).map(u => typeof u === 'string' ? {name:'', url:u} : u);
-    } catch(e) { console.error('Init Error', e); }
+try { 
+    const raw = atob(base64Var);
+    appData = JSON.parse(decodeURIComponent(escape(raw))); 
+    appData.urls = (appData.urls || []).map(u => typeof u === 'string' ? {name:'', url:u} : u);
+    appData.apis = (appData.apis || []).map(u => typeof u === 'string' ? {name:'', url:u} : u);
+} catch(e) { console.error('Init Error', e); }
 
-    // 修复：格式化时间为北京时间
-    function formatBeijingTime(isoString) {
-        if (!isoString) return '--';
-        // 直接解析ISO字符串，然后使用Asia/Shanghai时区格式化
-        const date = new Date(isoString);
-        return date.toLocaleString('zh-CN', {
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false,
-            timeZone: 'Asia/Shanghai' // 直接使用时区转换，不需要手动偏移
+function formatBeijingTime(isoString) {
+    if (!isoString) return '--';
+    const date = new Date(isoString);
+    return date.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Asia/Shanghai' });
+}
+
+function getRecipeHtml(sources) {
+    if(!sources) return '';
+    let html = '';
+    if(sources.includeCustom) html += '<span class="src-badge custom">📝 自定义IP</span>';
+    if(sources.files && sources.files.length) sources.files.forEach(f => {
+        // 区分是上传文件还是可编辑文件
+        if(appData.uploadedFiles.includes(f)) html += '<span class="src-badge file">📄 ' + escapeHtml(f) + '</span>';
+        else html += '<span class="src-badge editable">✏️ ' + escapeHtml(f) + '</span>';
+    });
+    if(sources.urls && sources.urls.length) {
+        sources.urls.forEach(idx => {
+            const item = appData.urls[idx];
+            const name = item ? (item.name || '订阅#'+(idx+1)) : '未知';
+            html += '<span class="src-badge sub">📡 ' + escapeHtml(name) + '</span>';
         });
     }
-
-    function getRecipeHtml(sources) {
-        if(!sources) return '';
-        let html = '';
-        if(sources.includeCustom) html += '<span class="src-badge custom">📝 自定义IP</span>';
-        if(sources.files && sources.files.length) sources.files.forEach(f => html += '<span class="src-badge file">📄 ' + escapeHtml(f) + '</span>');
-        
-        // 【v9.9】配方显示自定义名称
-        if(sources.urls && sources.urls.length) {
-            sources.urls.forEach(idx => {
-                const item = appData.urls[idx];
-                const name = item ? (item.name || '订阅#'+(idx+1)) : '未知';
-                html += '<span class="src-badge sub">📡 ' + escapeHtml(name) + '</span>';
-            });
-        }
-        if(sources.apis && sources.apis.length) {
-            sources.apis.forEach(idx => {
-                const item = appData.apis[idx];
-                const name = item ? (item.name || 'API#'+(idx+1)) : '未知';
-                html += '<span class="src-badge api">🔗 ' + escapeHtml(name) + '</span>';
-            });
-        }
-        return html;
+    if(sources.apis && sources.apis.length) {
+        sources.apis.forEach(idx => {
+            const item = appData.apis[idx];
+            const name = item ? (item.name || 'API#'+(idx+1)) : '未知';
+            html += '<span class="src-badge api">🔗 ' + escapeHtml(name) + '</span>';
+        });
     }
+    return html;
+}
 
-    function render() {
-        // 【v9.9】列表显示自定义名称
-        const renderSourceList = (id, list, type) => {
-            document.getElementById(id).innerHTML = list.map((item, i) => 
-                '<div class="item"><div class="item-content"><div style="font-weight:bold;color:var(--text-main)">' + (item.name ? escapeHtml(item.name) : '<span style="color:#9ca3af;font-style:italic">未命名</span>') + '</div><div style="font-size:0.75rem;color:#6b7280;margin-top:2px;word-break:break-all">' + escapeHtml(item.url) + '</div></div><button class="btn-danger" data-action="delete" data-type="' + type + '" data-val="' + i + '" style="padding:0.4rem 0.8rem;font-size:0.8rem">删除</button></div>'
-            ).join('');
-        };
-        
-        renderSourceList('url-list', appData.urls, 'urls');
-        renderSourceList('api-list', appData.apis, 'apis');
-        
-        document.getElementById('uploaded-list').innerHTML = appData.uploadedFiles.map(t => 
-            '<div class="item"><div class="item-content">📄 <strong>' + escapeHtml(t) + '</strong></div><div style="display:flex; gap:5px;"><button class="btn-secondary preview-btn" data-filename="' + escapeHtml(t) + '" style="padding:0.4rem;font-size:0.8rem">预览</button><button class="btn-danger" data-action="delete-file" data-val="' + escapeHtml(t) + '" style="padding:0.4rem;font-size:0.8rem">删除</button></div></div>'
+function render() {
+    const renderSourceList = (id, list, type) => {
+        document.getElementById(id).innerHTML = list.map((item, i) => 
+            '<div class="item"><div class="item-content"><div style="font-weight:bold;color:var(--text-main)">' + (item.name ? escapeHtml(item.name) : '<span style="color:#9ca3af;font-style:italic">未命名</span>') + '</div><div style="font-size:0.75rem;color:#6b7280;margin-top:2px;word-break:break-all">' + escapeHtml(item.url) + '</div></div><button class="btn-danger" data-action="delete" data-type="' + type + '" data-val="' + i + '" style="padding:0.4rem 0.8rem;font-size:0.8rem">删除</button></div>'
         ).join('');
+    };
+    renderSourceList('url-list', appData.urls, 'urls');
+    renderSourceList('api-list', appData.apis, 'apis');
+    
+    document.getElementById('uploaded-list').innerHTML = appData.uploadedFiles.map(t => 
+        '<div class="item"><div class="item-content">📄 <strong>' + escapeHtml(t) + '</strong></div><div style="display:flex; gap:5px;"><button class="btn-secondary preview-btn" data-filename="' + escapeHtml(t) + '" style="padding:0.4rem;font-size:0.8rem">预览</button><button class="btn-danger" data-action="delete-file" data-val="' + escapeHtml(t) + '" style="padding:0.4rem;font-size:0.8rem">删除</button></div></div>'
+    ).join('');
 
-        document.getElementById('custom-ips').value = appData.customIPs.join('\\n');
-        document.getElementById('ip-count').innerText = appData.customIPs.length;
+    document.getElementById('custom-ips').value = appData.customIPs.join('\\n');
+    document.getElementById('ip-count').innerText = appData.customIPs.length;
 
-        const ipSitesHtml = [];
-        const friendSitesHtml = [];
-        (appData.sitesList || []).forEach((s, realIdx) => {
-            if(s.type === 'ip') {
-               ipSitesHtml.push('<div class="item"><div class="item-content"><a href="' + escapeHtml(s.url) + '" target="_blank" style="font-weight:bold;color:var(--primary);text-decoration:none">🔗 ' + escapeHtml(s.name) + '</a><div style="color:#666;font-size:0.8rem">' + escapeHtml(s.url) + '</div></div><button class="btn-danger" data-action="del-site" data-val="' + realIdx + '" style="padding:0.4rem;font-size:0.8rem">删除</button></div>');
-            } else if(s.type === 'friend') {
-               friendSitesHtml.push('<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;"><a href="' + escapeHtml(s.url) + '" target="_blank" class="link-card" style="flex:1;margin-bottom:0">👉 ' + escapeHtml(s.name) + '</a><span data-action="del-site" data-val="' + realIdx + '" style="cursor:pointer;color:#999;font-size:0.8rem;padding:0 5px;">✕</span></div>');
-            }
-        });
-        document.getElementById('site-list-ip').innerHTML = ipSitesHtml.join('');
-        document.getElementById('friend-links-list').innerHTML = friendSitesHtml.join('');
+    const ipSitesHtml = [];
+    const friendSitesHtml = [];
+    (appData.sitesList || []).forEach((s, realIdx) => {
+        if(s.type === 'ip') {
+           ipSitesHtml.push('<div class="item"><div class="item-content"><a href="' + escapeHtml(s.url) + '" target="_blank" style="font-weight:bold;color:var(--primary);text-decoration:none">🔗 ' + escapeHtml(s.name) + '</a><div style="color:#666;font-size:0.8rem">' + escapeHtml(s.url) + '</div></div><button class="btn-danger" data-action="del-site" data-val="' + realIdx + '" style="padding:0.4rem;font-size:0.8rem">删除</button></div>');
+        } else if(s.type === 'friend') {
+           friendSitesHtml.push('<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;"><a href="' + escapeHtml(s.url) + '" target="_blank" class="link-card" style="flex:1;margin-bottom:0">👉 ' + escapeHtml(s.name) + '</a><span data-action="del-site" data-val="' + realIdx + '" style="cursor:pointer;color:#999;font-size:0.8rem;padding:0 5px;">✕</span></div>');
+        }
+    });
+    document.getElementById('site-list-ip').innerHTML = ipSitesHtml.join('');
+    document.getElementById('friend-links-list').innerHTML = friendSitesHtml.join('');
 
-        // 【v9.9】Checkbox 显示自定义名称
-        const renderChecks = (prefix) => {
+    const renderChecks = (prefix) => {
+        let html = '';
+        if(appData.uploadedFiles.length) {
+            html += '<div style="grid-column:1/-1;font-weight:bold;color:var(--primary);margin-top:5px;border-bottom:1px solid #e5e7eb">📂 上传的文件</div>';
+            appData.uploadedFiles.forEach(f => { html += '<label><input type="checkbox" value="' + escapeHtml(f) + '" class="' + prefix + '-file-cb"> ' + escapeHtml(f) + '</label>'; });
+        }
+        if(appData.editableFiles.length) {
+            html += '<div style="grid-column:1/-1;font-weight:bold;color:#7c3aed;margin-top:5px;border-bottom:1px solid #e5e7eb">✏️ 可编辑文件</div>';
+            appData.editableFiles.forEach(f => { html += '<label><input type="checkbox" value="' + escapeHtml(f.name) + '" class="' + prefix + '-file-cb"> ' + escapeHtml(f.name) + '</label>'; });
+        }
+        if(appData.urls.length) {
+            html += '<div style="grid-column:1/-1;font-weight:bold;color:var(--primary);margin-top:10px;border-bottom:1px solid #e5e7eb">📡 订阅链接</div>';
+            appData.urls.forEach((item,i) => { 
+                const name = item.name || ('订阅 #' + (i+1));
+                html += '<label><input type="checkbox" value="' + i + '" class="' + prefix + '-url-cb"> ' + escapeHtml(name) + '</label>'; 
+            });
+        }
+        if(appData.apis.length) {
+            html += '<div style="grid-column:1/-1;font-weight:bold;color:var(--primary);margin-top:10px;border-bottom:1px solid #e5e7eb">🔗 API</div>';
+            appData.apis.forEach((item,i) => { 
+                const name = item.name || ('API #' + (i+1));
+                html += '<label><input type="checkbox" value="' + i + '" class="' + prefix + '-api-cb"> ' + escapeHtml(name) + '</label>'; 
+            });
+        }
+        return html || '<div style="color:#888;padding:10px">⚠️ 暂无数据源</div>';
+    };
+    document.getElementById('ext-sources').innerHTML = renderChecks('ext');
+    document.getElementById('file-sources').innerHTML = renderChecks('file');
+
+    document.getElementById('file-list').innerHTML = appData.ipFiles.map(f => {
+        const stats = f.stats || { total: 0, today: 0, lastAccess: null };
+        const lastAccessStr = stats.lastAccess ? formatBeijingTime(stats.lastAccess) : '--';
+        return '<div class="item"><div class="item-content" style="display:flex;flex-direction:column;gap:4px"><div style="font-weight:700;color:var(--primary)">' + escapeHtml(f.name) + ' ' + (f.autoUpdate?'<span class="badge auto">🔄 自动</span>':'<span class="badge">⚪️ 手动</span>') + '</div><div style="margin-top:5px;display:flex;flex-wrap:wrap;gap:4px">' + getRecipeHtml(f.sources) + '</div><div class="stats-info"><span>🔥 ' + (stats.total||0) + '次</span><span>🕒 ' + lastAccessStr + '</span></div><div style="display:flex;gap:10px;margin-top:5px"><a href="' + currentOrigin + '/ip/' + f.name + '" target="_blank" style="color:var(--primary);text-decoration:none;font-weight:600">🔗 Workers链接</a><a href="' + currentOrigin + '/r2/' + f.name + '" target="_blank" style="color:#10b981;text-decoration:none;font-weight:600">🚀 R2直链</a></div></div><div style="display:flex;flex-direction:column;gap:5px"><button class="btn-warning" data-action="update-file" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">⚡️</button><button class="btn-secondary" data-action="edit-sources" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">✏️</button><button class="btn-secondary" data-action="reset-stats" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">🔄</button><button class="btn-danger" data-action="delete-file-gen" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">🗑️</button></div></div>';
+    }).join('');
+
+    document.getElementById('editable-list').innerHTML = (appData.editableFiles || []).map(f => {
+        const stats = f.stats || { total: 0, today: 0, lastAccess: null };
+        const lastAccessStr = stats.lastAccess ? formatBeijingTime(stats.lastAccess) : '--';
+        const ipCount = f.ips ? f.ips.length : 0;
+        return '<div class="item"><div class="item-content" style="display:flex;flex-direction:column;gap:4px"><div style="font-weight:700;color:#7c3aed">' + escapeHtml(f.name) + ' <span class="badge editable">✏️ 可编辑</span></div><div class="stats-info"><span>📊 ' + ipCount + ' 个IP</span><span>📅 ' + formatBeijingTime(f.lastUpdate) + ' 更新</span></div></div><div style="display:flex;flex-direction:column;gap:5px"><button class="btn-primary" data-action="edit-file" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">✏️ 编辑</button><button class="btn-danger" data-action="delete-editable" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">🗑️</button></div></div>';
+    }).join('');
+}
+
+document.addEventListener('click', async e => {
+    const t = e.target;
+    if (t.classList.contains('tab')) {
+        document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(x=>x.classList.remove('active'));
+        t.classList.add('active');
+        document.getElementById(t.dataset.tab + '-tab').classList.add('active');
+        return;
+    }
+    if (t.classList.contains('sub-tab')) {
+        const parent = t.closest('.tab-content');
+        parent.querySelectorAll('.sub-tab').forEach(x=>x.classList.remove('active'));
+        parent.querySelectorAll('.sub-tab-content').forEach(x=>x.classList.remove('active'));
+        t.classList.add('active');
+        document.getElementById(t.dataset.subTab + '-sub-tab').classList.add('active');
+        return;
+    }
+    if(t.closest('#upload-box')) { document.getElementById('file-input').click(); return; }
+    
+    if(t.classList.contains('preview-btn')) {
+        const fileName = t.dataset.filename;
+        t.disabled = true; t.innerText = '...';
+        try {
+            const res = await apiCall('/api/extract', 'POST', { sources: { files: [fileName], urls: [], apis: [], includeCustom: false } });
+            alert('文件 "' + fileName + '" 可提取 ' + res.count + ' 个IP:\\n\\n' + res.ips.slice(0, 5).join('\\n') + (res.count > 5 ? '\\n...' : ''));
+        } catch(e) { showMsg(e.message, 'error'); }
+        t.disabled = false; t.innerText = '预览';
+    }
+
+    if(t.id === 'ext-select-all') { document.querySelectorAll('#ext-sources input[type="checkbox"]').forEach(cb => cb.checked = true); }
+    if(t.id === 'ext-deselect-all') { document.querySelectorAll('#ext-sources input[type="checkbox"]').forEach(cb => cb.checked = false); }
+    if(t.id === 'file-select-all') { document.querySelectorAll('#file-sources input[type="checkbox"]').forEach(cb => cb.checked = true); }
+    if(t.id === 'file-deselect-all') { document.querySelectorAll('#file-sources input[type="checkbox"]').forEach(cb => cb.checked = false); }
+
+    const action = t.dataset.action;
+    const val = t.dataset.val;
+    
+    if(action === 'delete') {
+        if(confirm('确认删除?')) { 
+            const type = t.dataset.type;
+            const idx = parseInt(val);
+            try {
+                const res = await apiCall('/api/' + type, 'DELETE', {index: idx});
+                if(res.success) {
+                    if(type === 'urls') appData.urls.splice(idx, 1);
+                    else if(type === 'apis') appData.apis.splice(idx, 1);
+                    render();
+                    showMsg('已删除'); 
+                } else { showMsg(res.error || '删除失败', 'error'); }
+            } catch(e) { showMsg(e.message, 'error'); }
+        }
+    } 
+    else if(action === 'delete-file') {
+        if(confirm('确认删除文件 ' + val + '?')) { 
+            try {
+                const res = await apiCall('/api/uploaded_files', 'DELETE', {fileName: val});
+                if(res.success) {
+                    const idx = appData.uploadedFiles.indexOf(val);
+                    if(idx !== -1) { appData.uploadedFiles.splice(idx, 1); render(); }
+                    showMsg('已删除');
+                } else { showMsg(res.error || '删除失败', 'error'); }
+            } catch(e) { showMsg(e.message, 'error'); }
+        }
+    } 
+    else if(action === 'delete-file-gen') {
+        if(confirm('删除生成的文件?')) { 
+            try {
+                const res = await fetch('/api/ipfiles?name=' + val, {method:'DELETE'});
+                const result = await res.json();
+                if(result.success) {
+                    const idx = appData.ipFiles.findIndex(f => f.name === val);
+                    if(idx !== -1) { appData.ipFiles.splice(idx, 1); render(); }
+                    showMsg('已删除');
+                } else { showMsg(result.error || '删除失败', 'error'); }
+            } catch(e) { showMsg(e.message, 'error'); }
+        }
+    } 
+    else if(action === 'delete-editable') {
+        if(confirm('删除可编辑文件?')) { 
+            try {
+                const res = await apiCall('/api/editable_files', 'DELETE', {fileName: val});
+                if(res.success) {
+                    const idx = appData.editableFiles.findIndex(f => f.name === val);
+                    if(idx !== -1) { appData.editableFiles.splice(idx, 1); render(); }
+                    showMsg('已删除');
+                } else { showMsg(res.error || '删除失败', 'error'); }
+            } catch(e) { showMsg(e.message, 'error'); }
+        }
+    }
+    else if(action === 'update-file') {
+        if(confirm('立即更新?')) { 
+            const res = await apiCall('/api/ipfiles', 'PUT', {fileName: val}); 
+            const idx = appData.ipFiles.findIndex(f => f.name === val);
+            if(idx !== -1 && res.meta) { appData.ipFiles[idx] = {...appData.ipFiles[idx], ...res.meta}; render(); }
+            showMsg('更新成功'); 
+        }
+    } 
+    else if(action === 'edit-file') {
+        currentEditingFile = val;
+        const fileData = appData.editableFiles.find(f => f.name === val);
+        if(fileData) {
+            currentEditingIPs = [...(fileData.ips || [])];
+            openEditModal();
+        }
+    }
+    else if(action === 'reset-stats') {
+        if(confirm('确认重置文件 "' + val + '" 的访问统计?')) { 
+            try {
+                await apiCall('/api/reset-stats', 'POST', {fileName: val});
+                const idx = [...appData.ipFiles, ...appData.editableFiles].findIndex(f => f.name === val);
+                if(idx !== -1) {
+                    if(idx < appData.ipFiles.length) appData.ipFiles[idx].stats = { total: 0, today: 0, lastAccess: null };
+                    else appData.editableFiles[idx - appData.ipFiles.length].stats = { total: 0, today: 0, lastAccess: null };
+                    render();
+                }
+                showMsg('统计已重置'); 
+            } catch(e) { showMsg(e.message, 'error'); }
+        }
+    }
+    else if(action === 'edit-sources') {
+        const fileName = val;
+        currentEditingFile = fileName;
+        const fileMeta = appData.ipFiles.find(f => f.name === fileName);
+        if(!fileMeta) { showMsg('文件不存在', 'error'); return; }
+        document.getElementById('edit-file-name').textContent = fileName;
+        document.getElementById('edit-auto-update').checked = fileMeta.autoUpdate || false;
+        const renderEditChecks = () => {
             let html = '';
             if(appData.uploadedFiles.length) {
                 html += '<div style="grid-column:1/-1;font-weight:bold;color:var(--primary);margin-top:5px;border-bottom:1px solid #e5e7eb">📂 上传的文件</div>';
-                appData.uploadedFiles.forEach(f => { html += '<label><input type="checkbox" value="' + escapeHtml(f) + '" class="' + prefix + '-file-cb"> ' + escapeHtml(f) + '</label>'; });
+                appData.uploadedFiles.forEach(f => { 
+                    const checked = fileMeta.sources.files && fileMeta.sources.files.includes(f) ? 'checked' : '';
+                    html += '<label><input type="checkbox" value="' + escapeHtml(f) + '" class="edit-file-cb" ' + checked + '> ' + escapeHtml(f) + '</label>'; 
+                });
+            }
+            if(appData.editableFiles.length) {
+                html += '<div style="grid-column:1/-1;font-weight:bold;color:#7c3aed;margin-top:5px;border-bottom:1px solid #e5e7eb">✏️ 可编辑文件</div>';
+                appData.editableFiles.forEach(f => { 
+                    const checked = fileMeta.sources.files && fileMeta.sources.files.includes(f.name) ? 'checked' : '';
+                    html += '<label><input type="checkbox" value="' + escapeHtml(f.name) + '" class="edit-file-cb" ' + checked + '> ' + escapeHtml(f.name) + '</label>'; 
+                });
             }
             if(appData.urls.length) {
                 html += '<div style="grid-column:1/-1;font-weight:bold;color:var(--primary);margin-top:10px;border-bottom:1px solid #e5e7eb">📡 订阅链接</div>';
                 appData.urls.forEach((item,i) => { 
                     const name = item.name || ('订阅 #' + (i+1));
-                    html += '<label><input type="checkbox" value="' + i + '" class="' + prefix + '-url-cb"> ' + escapeHtml(name) + '</label>'; 
+                    const checked = fileMeta.sources.urls && fileMeta.sources.urls.includes(i) ? 'checked' : '';
+                    html += '<label><input type="checkbox" value="' + i + '" class="edit-url-cb" ' + checked + '> ' + escapeHtml(name) + '</label>'; 
                 });
             }
             if(appData.apis.length) {
                 html += '<div style="grid-column:1/-1;font-weight:bold;color:var(--primary);margin-top:10px;border-bottom:1px solid #e5e7eb">🔗 API</div>';
                 appData.apis.forEach((item,i) => { 
                     const name = item.name || ('API #' + (i+1));
-                    html += '<label><input type="checkbox" value="' + i + '" class="' + prefix + '-api-cb"> ' + escapeHtml(name) + '</label>'; 
+                    const checked = fileMeta.sources.apis && fileMeta.sources.apis.includes(i) ? 'checked' : '';
+                    html += '<label><input type="checkbox" value="' + i + '" class="edit-api-cb" ' + checked + '> ' + escapeHtml(name) + '</label>'; 
                 });
             }
             return html || '<div style="color:#888;padding:10px">⚠️ 暂无数据源</div>';
         };
-        document.getElementById('ext-sources').innerHTML = renderChecks('ext');
-        document.getElementById('file-sources').innerHTML = renderChecks('file');
-
-        // 修复：统计显示，使用北京时间
-        document.getElementById('file-list').innerHTML = appData.ipFiles.map(f => {
-            const stats = f.stats || { total: 0, today: 0, lastAccess: null };
-            const lastAccessStr = stats.lastAccess ? formatBeijingTime(stats.lastAccess) : '--';
-            
-            return '<div class="item"><div class="item-content" style="display:flex;flex-direction:column;gap:4px"><div style="font-weight:700;color:var(--primary)">' + escapeHtml(f.name) + ' ' + (f.autoUpdate?'<span class="badge auto">🔄 自动</span>':'<span class="badge">⚪️ 手动</span>') + '</div><div style="margin-top:5px;display:flex;flex-wrap:wrap;gap:4px">' + getRecipeHtml(f.sources) + '</div><div class="stats-info"><span>🔥 ' + (stats.total||0) + '次</span><span>🕒 ' + lastAccessStr + '</span></div><a href="' + currentOrigin + '/ip/' + f.name + '" target="_blank" style="color:var(--primary);text-decoration:none;font-weight:600">🔗 链接地址</a></div><div style="display:flex;flex-direction:column;gap:5px"><button class="btn-warning" data-action="update-file" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">⚡️</button><button class="btn-secondary" data-action="edit-sources" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">✏️</button><button class="btn-secondary" data-action="reset-stats" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">🔄</button><button class="btn-danger" data-action="delete-file-gen" data-val="' + escapeHtml(f.name) + '" style="padding:0.4rem;font-size:0.8rem">🗑️</button></div></div>';
-        }).join('');
+        document.getElementById('edit-sources').innerHTML = renderEditChecks();
+        document.getElementById('edit-custom').checked = fileMeta.sources.includeCustom || false;
+        document.getElementById('edit-sources-modal').style.display = 'block';
     }
-
-    document.addEventListener('click', async e => {
-        const t = e.target;
-        if (t.classList.contains('tab')) {
-            document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(x=>x.classList.remove('active'));
-            t.classList.add('active');
-            document.getElementById(t.dataset.tab + '-tab').classList.add('active');
-            return;
-        }
-        if (t.classList.contains('sub-tab')) {
-            const parent = t.closest('.tab-content');
-            parent.querySelectorAll('.sub-tab').forEach(x=>x.classList.remove('active'));
-            parent.querySelectorAll('.sub-tab-content').forEach(x=>x.classList.remove('active'));
-            t.classList.add('active');
-            document.getElementById(t.dataset.subTab + '-sub-tab').classList.add('active');
-            return;
-        }
-        if(t.closest('#upload-box')) { document.getElementById('file-input').click(); return; }
-        
-        if(t.classList.contains('preview-btn')) {
-            const fileName = t.dataset.filename;
-            t.disabled = true; t.innerText = '...';
+    else if(action === 'del-site') {
+        if(confirm('删除此链接?')) { 
             try {
-                const res = await apiCall('/api/extract', 'POST', { sources: { files: [fileName], urls: [], apis: [], includeCustom: false } });
-                alert('文件 "' + fileName + '" 可提取 ' + res.count + ' 个IP:\\n\\n' + res.ips.slice(0, 5).join('\\n') + (res.count > 5 ? '\\n...' : ''));
+                const res = await apiCall('/api/sites', 'DELETE', {index: parseInt(val)});
+                if(res.success) { appData.sitesList.splice(parseInt(val), 1); render(); showMsg('已删除'); } else { showMsg(res.error || '删除失败', 'error'); }
             } catch(e) { showMsg(e.message, 'error'); }
-            t.disabled = false; t.innerText = '预览';
         }
-
-        if(t.id === 'ext-select-all') { document.querySelectorAll('#ext-sources input[type="checkbox"]').forEach(cb => cb.checked = true); }
-        if(t.id === 'ext-deselect-all') { document.querySelectorAll('#ext-sources input[type="checkbox"]').forEach(cb => cb.checked = false); }
-        if(t.id === 'file-select-all') { document.querySelectorAll('#file-sources input[type="checkbox"]').forEach(cb => cb.checked = true); }
-        if(t.id === 'file-deselect-all') { document.querySelectorAll('#file-sources input[type="checkbox"]').forEach(cb => cb.checked = false); }
-        if(t.id === 'edit-select-all') { document.querySelectorAll('#edit-sources input[type="checkbox"]').forEach(cb => cb.checked = true); }
-        if(t.id === 'edit-deselect-all') { document.querySelectorAll('#edit-sources input[type="checkbox"]').forEach(cb => cb.checked = false); }
-
-        const action = t.dataset.action;
-        const val = t.dataset.val;
-        
-        // 修复：删除操作处理
-        if(action === 'delete') {
-            if(confirm('确认删除?')) { 
-                const type = t.dataset.type;
-                const idx = parseInt(val);
-                try {
-                    const res = await apiCall('/api/' + type, 'DELETE', {index: idx});
-                    if(res.success) {
-                        if(type === 'urls') appData.urls.splice(idx, 1);
-                        else if(type === 'apis') appData.apis.splice(idx, 1);
-                        render();
-                        showMsg('已删除'); 
-                    } else {
-                        showMsg(res.error || '删除失败', 'error');
-                    }
-                } catch(e) {
-                    showMsg(e.message, 'error');
-                }
-            }
-        } 
-        else if(action === 'delete-file') {
-            if(confirm('确认删除文件 ' + val + '?')) { 
-                try {
-                    const res = await apiCall('/api/uploaded_files', 'DELETE', {fileName: val});
-                    if(res.success) {
-                        const idx = appData.uploadedFiles.indexOf(val);
-                        if(idx !== -1) {
-                            appData.uploadedFiles.splice(idx, 1);
-                            render();
-                        }
-                        showMsg('已删除');
-                    } else {
-                        showMsg(res.error || '删除失败', 'error');
-                    }
-                } catch(e) {
-                    showMsg(e.message, 'error');
-                }
-            }
-        } 
-        else if(action === 'delete-file-gen') {
-            if(confirm('删除生成的文件?')) { 
-                try {
-                    const res = await fetch('/api/ipfiles?name=' + val, {method:'DELETE'});
-                    const result = await res.json();
-                    if(result.success) {
-                        const idx = appData.ipFiles.findIndex(f => f.name === val);
-                        if(idx !== -1) {
-                            appData.ipFiles.splice(idx, 1);
-                            render();
-                        }
-                        showMsg('已删除');
-                    } else {
-                        showMsg(result.error || '删除失败', 'error');
-                    }
-                } catch(e) {
-                    showMsg(e.message, 'error');
-                }
-            }
-        } 
-        else if(action === 'update-file') {
-            if(confirm('立即更新?')) { 
-                const res = await apiCall('/api/ipfiles', 'PUT', {fileName: val}); 
-                const idx = appData.ipFiles.findIndex(f => f.name === val);
-                if(idx !== -1 && res.meta) {
-                    appData.ipFiles[idx] = {...appData.ipFiles[idx], ...res.meta};
-                    render();
-                }
-                showMsg('更新成功'); 
-            }
-        } 
-        // 修复：重置统计功能
-        else if(action === 'reset-stats') {
-            if(confirm('确认重置文件 "' + val + '" 的访问统计?')) { 
-                try {
-                    await apiCall('/api/reset-stats', 'POST', {fileName: val});
-                    const idx = appData.ipFiles.findIndex(f => f.name === val);
-                    if(idx !== -1) {
-                        appData.ipFiles[idx].stats = { total: 0, today: 0, lastAccess: null };
-                        render();
-                    }
-                    showMsg('统计已重置'); 
-                } catch(e) {
-                    showMsg(e.message, 'error');
-                }
-            }
+    }
+    
+    if(t.id === 'btn-add-url') {
+        const name = document.getElementById('new-url-name').value;
+        const url = document.getElementById('new-url-link').value;
+        if(url) {
+            const item = {name, url}; appData.urls.push(item);
+            document.getElementById('new-url-name').value=''; document.getElementById('new-url-link').value='';
+            render(); apiCall('/api/urls', 'POST', {items:[item]}); showMsg('已添加');
         }
-        // 新增编辑数据源功能
-        else if(action === 'edit-sources') {
-            const fileName = val;
+    }
+    if(t.id === 'btn-add-api') {
+        const name = document.getElementById('new-api-name').value;
+        const url = document.getElementById('new-api-link').value;
+        if(url) {
+            const item = {name, url}; appData.apis.push(item);
+            document.getElementById('new-api-name').value=''; document.getElementById('new-api-link').value='';
+            render(); apiCall('/api/apis', 'POST', {items:[item]}); showMsg('已添加');
+        }
+    }
+    if(t.id === 'btn-save-custom') { const v=getLines('custom-ips'); appData.customIPs = v; render(); apiCall('/api/custom','POST',{ips:v}); showMsg('保存成功'); }
+    if(t.id === 'btn-clear-custom') { if(confirm('清空?')) { document.getElementById('custom-ips').value=''; document.getElementById('btn-save-custom').click(); } }
+    
+    if(t.id === 'btn-add-site-ip') addSite('site-name-ip', 'site-url-ip', 'ip');
+    if(t.id === 'btn-add-site-friend') addSite('site-name-friend', 'site-url-friend', 'friend');
+
+    if(t.id === 'btn-extract') doExtract(t);
+    if(t.id === 'btn-copy-extract') {
+        if(lastExtractResult.length > 0) {
+            navigator.clipboard.writeText(lastExtractResult.join('\\n'));
+            showMsg('已复制 ' + lastExtractResult.length + ' 个IP');
+        }
+    }
+    if(t.id === 'btn-save-file') doSaveFile(t);
+    if(t.id === 'btn-tool-run') doTool(t);
+    if(t.id === 'btn-tool-copy') { navigator.clipboard.writeText(document.getElementById('tool-output').innerText); showMsg('已复制'); }
+    if(t.id === 'btn-tool-save') { saveToolResultAsEditable(); }
+    
+    if(t.id === 'btn-create-editable') {
+        const fileName = prompt('请输入文件名:');
+        if(fileName) {
             currentEditingFile = fileName;
-            
-            // 获取文件元数据
-            const fileMeta = appData.ipFiles.find(f => f.name === fileName);
-            if(!fileMeta) {
-                showMsg('文件不存在', 'error');
-                return;
-            }
-            
-            // 显示文件名和当前配置
-            document.getElementById('edit-file-name').textContent = fileName;
-            document.getElementById('edit-auto-update').checked = fileMeta.autoUpdate || false;
-            
-            // 渲染数据源选择框
-            const renderEditChecks = () => {
-                let html = '';
-                if(appData.uploadedFiles.length) {
-                    html += '<div style="grid-column:1/-1;font-weight:bold;color:var(--primary);margin-top:5px;border-bottom:1px solid #e5e7eb">📂 上传的文件</div>';
-                    appData.uploadedFiles.forEach(f => { 
-                        const checked = fileMeta.sources.files && fileMeta.sources.files.includes(f) ? 'checked' : '';
-                        html += '<label><input type="checkbox" value="' + escapeHtml(f) + '" class="edit-file-cb" ' + checked + '> ' + escapeHtml(f) + '</label>'; 
-                    });
-                }
-                if(appData.urls.length) {
-                    html += '<div style="grid-column:1/-1;font-weight:bold;color:var(--primary);margin-top:10px;border-bottom:1px solid #e5e7eb">📡 订阅链接</div>';
-                    appData.urls.forEach((item,i) => { 
-                        const name = item.name || ('订阅 #' + (i+1));
-                        const checked = fileMeta.sources.urls && fileMeta.sources.urls.includes(i) ? 'checked' : '';
-                        html += '<label><input type="checkbox" value="' + i + '" class="edit-url-cb" ' + checked + '> ' + escapeHtml(name) + '</label>'; 
-                    });
-                }
-                if(appData.apis.length) {
-                    html += '<div style="grid-column:1/-1;font-weight:bold;color:var(--primary);margin-top:10px;border-bottom:1px solid #e5e7eb">🔗 API</div>';
-                    appData.apis.forEach((item,i) => { 
-                        const name = item.name || ('API #' + (i+1));
-                        const checked = fileMeta.sources.apis && fileMeta.sources.apis.includes(i) ? 'checked' : '';
-                        html += '<label><input type="checkbox" value="' + i + '" class="edit-api-cb" ' + checked + '> ' + escapeHtml(name) + '</label>'; 
-                    });
-                }
-                return html || '<div style="color:#888;padding:10px">⚠️ 暂无数据源</div>';
-            };
-            
-            document.getElementById('edit-sources').innerHTML = renderEditChecks();
-            document.getElementById('edit-custom').checked = fileMeta.sources.includeCustom || false;
-            
-            // 显示模态框
-            document.getElementById('edit-sources-modal').style.display = 'block';
+            currentEditingIPs = [];
+            openEditModal();
         }
-        else if(action === 'del-site') {
-            if(confirm('删除此链接?')) { 
-                try {
-                    const res = await apiCall('/api/sites', 'DELETE', {index: parseInt(val)});
-                    if(res.success) {
-                        appData.sitesList.splice(parseInt(val), 1);
-                        render();
-                        showMsg('已删除'); 
-                    } else {
-                        showMsg(res.error || '删除失败', 'error');
-                    }
-                } catch(e) {
-                    showMsg(e.message, 'error');
-                }
-            }
-        }
-        
-        // 【v9.9】添加源支持名称
-        if(t.id === 'btn-add-url') {
-            const name = document.getElementById('new-url-name').value;
-            const url = document.getElementById('new-url-link').value;
-            if(url) {
-                const item = {name, url};
-                appData.urls.push(item);
-                document.getElementById('new-url-name').value='';
-                document.getElementById('new-url-link').value='';
-                render();
-                apiCall('/api/urls', 'POST', {items:[item]});
-                showMsg('已添加');
-            }
-        }
-        if(t.id === 'btn-add-api') {
-            const name = document.getElementById('new-api-name').value;
-            const url = document.getElementById('new-api-link').value;
-            if(url) {
-                const item = {name, url};
-                appData.apis.push(item);
-                document.getElementById('new-api-name').value='';
-                document.getElementById('new-api-link').value='';
-                render();
-                apiCall('/api/apis', 'POST', {items:[item]});
-                showMsg('已添加');
-            }
-        }
-        if(t.id === 'btn-save-custom') { const v=getLines('custom-ips'); appData.customIPs = v; render(); apiCall('/api/custom','POST',{ips:v}); showMsg('保存成功'); }
-        if(t.id === 'btn-clear-custom') { if(confirm('清空?')) { document.getElementById('custom-ips').value=''; document.getElementById('btn-save-custom').click(); } }
-        
-        if(t.id === 'btn-add-site-ip') addSite('site-name-ip', 'site-url-ip', 'ip');
-        if(t.id === 'btn-add-site-friend') addSite('site-name-friend', 'site-url-friend', 'friend');
-
-        if(t.id === 'btn-extract') doExtract(t);
-        if(t.id === 'btn-copy-extract') {
-            if(lastExtractResult.length > 0) {
-                navigator.clipboard.writeText(lastExtractResult.join('\\n'));
-                showMsg('已复制 ' + lastExtractResult.length + ' 个IP');
-            }
-        }
-        if(t.id === 'btn-save-file') doSaveFile(t);
-        if(t.id === 'btn-tool-run') doTool(t);
-        if(t.id === 'btn-tool-copy') { navigator.clipboard.writeText(document.getElementById('tool-output').innerText); showMsg('已复制'); }
-        
-        // 编辑模态框相关事件
-        if(t.id === 'btn-cancel-edit' || t.classList.contains('close')) {
-            document.getElementById('edit-sources-modal').style.display = 'none';
-            currentEditingFile = null;
-        }
-        
-        if(t.id === 'btn-save-edit-sources') {
-            const sources = {
-                urls: Array.from(document.querySelectorAll('.edit-url-cb:checked')).map(cb => parseInt(cb.value)),
-                apis: Array.from(document.querySelectorAll('.edit-api-cb:checked')).map(cb => parseInt(cb.value)),
-                files: Array.from(document.querySelectorAll('.edit-file-cb:checked')).map(cb => cb.value),
-                includeCustom: document.getElementById('edit-custom').checked
-            };
-            
-            const autoUpdate = document.getElementById('edit-auto-update').checked;
-            
-            t.disabled = true;
-            t.innerText = '保存中...';
-            
-            try {
-                const res = await apiCall('/api/ipfiles', 'PATCH', { 
-                    fileName: currentEditingFile, 
-                    sources: sources,
-                    autoUpdate: autoUpdate
-                });
-                
-                if(res.success) {
-                    showMsg('数据源已更新，文件已重新生成');
-                    document.getElementById('edit-sources-modal').style.display = 'none';
-                    
-                    // 更新文件元数据
-                    const idx = appData.ipFiles.findIndex(f => f.name === currentEditingFile);
-                    if(idx !== -1 && res.meta) {
-                        appData.ipFiles[idx] = {...appData.ipFiles[idx], ...res.meta};
-                        render();
-                    }
-                }
-            } catch(e) {
-                showMsg(e.message, 'error');
-            } finally {
-                t.disabled = false;
-                t.innerText = '保存并重新生成';
-            }
-        }
-    });
-  
-    document.getElementById('file-input').addEventListener('change', async function() {
-        if(!this.files.length) return;
-        const fd = new FormData(); fd.append('file', this.files[0]);
-        showMsg('上传中...', 'success');
-        try {
-            const res = await fetch('/api/upload', {method:'POST', body:fd});
-            const j = await res.json();
-            if(!res.ok) throw new Error(j.error || '上传失败');
-            if(!appData.uploadedFiles.includes(j.fileName)) {
-                appData.uploadedFiles.push(j.fileName);
-                render();
-            }
-            showMsg('上传成功: ' + j.fileName);
-        } catch(e) { showMsg(e.message, 'error'); }
-        this.value = '';
-    });
-  
-    function escapeHtml(s) { return s ? s.toString().replace(/&/g,"&amp;").replace(/</g,"&lt;") : ''; }
-    function getLines(id) { return document.getElementById(id).value.split('\\n').map(x=>x.trim()).filter(x=>x); }
-    function showMsg(txt, type) {
-        if(!type) type = 'success';
-        const m = document.getElementById('message'); m.innerText=txt; m.className='message '+type; m.style.display='block';
-        setTimeout(()=>{ m.style.display='none'; }, 3000);
     }
-    async function apiCall(u, m, d) {
-        const r = await fetch(u, {method:m, headers:{'Content-Type':'application/json'}, body:JSON.stringify(d)});
-        if(!r.ok) { const err = await r.json(); throw new Error(err.error || '请求失败'); }
-        return r.json();
+    
+    if(t.id === 'btn-batch-add') {
+        const text = document.getElementById('batch-ip-input').value;
+        const parsed = parseBatchInput(text);
+        if(parsed.length) {
+            currentEditingIPs.push(...parsed);
+            renderEditableIPList();
+            document.getElementById('batch-ip-input').value = '';
+            showMsg('已追加 ' + parsed.length + ' 个IP');
+        } else { showMsg('未识别到有效IP', 'error'); }
     }
-    async function refresh() {
-        try {
-            const [u,a,c,up,f,s] = await Promise.all([
-                fetch('/api/urls').then(x=>x.json()),
-                fetch('/api/apis').then(x=>x.json()),
-                fetch('/api/custom').then(x=>x.json()),
-                fetch('/api/uploaded_files').then(x=>x.json()),
-                fetch('/api/ipfiles').then(x=>x.json()),
-                fetch('/api/sites').then(x=>x.json())
-            ]);
-            appData = {urls:u, apis:a, customIPs:c.ips||[], uploadedFiles:up, ipFiles:f, sitesList:s};
-            render();
-        } catch(e) { console.error(e); }
+    
+    if(t.id === 'btn-batch-replace') {
+        if(!confirm('确定要覆盖现有列表吗？此操作不可撤销。')) return;
+        const text = document.getElementById('batch-ip-input').value;
+        const parsed = parseBatchInput(text);
+        if(parsed.length) {
+            currentEditingIPs = parsed;
+            renderEditableIPList();
+            document.getElementById('batch-ip-input').value = '';
+            showMsg('已覆盖导入 ' + parsed.length + ' 个IP');
+        } else { showMsg('未识别到有效IP', 'error'); }
     }
-  
-    async function addSite(nameId, urlId, type) {
-        const n = document.getElementById(nameId).value;
-        const u = document.getElementById(urlId).value;
-        if(!n || !u) return alert('请填写完整');
-        appData.sitesList.push({name:n, url:u, type:type});
-        document.getElementById(nameId).value=''; document.getElementById(urlId).value='';
-        render();
-        apiCall('/api/sites', 'POST', {name:n, url:u, type:type});
-        showMsg('已添加链接');
+    
+    if(t.id === 'btn-clear-all') {
+        if(confirm('确定要清空所有IP吗？')) {
+            currentEditingIPs = [];
+            renderEditableIPList();
+        }
     }
-    function getSources(p) {
-        return {
-            urls: Array.from(document.querySelectorAll('.'+p+'-url-cb:checked')).map(x=>+x.value),
-            apis: Array.from(document.querySelectorAll('.'+p+'-api-cb:checked')).map(x=>+x.value),
-            files: Array.from(document.querySelectorAll('.'+p+'-file-cb:checked')).map(x=>x.value),
-            includeCustom: document.getElementById(p+'-custom').checked
+    
+    if(t.id === 'btn-copy-list') {
+        const text = currentEditingIPs.map(ip => ip.port ? \`\${ip.ip}:\${ip.port}\${ip.remark ? '#' + ip.remark : ''}\` : \`\${ip.ip}\${ip.remark ? '#' + ip.remark : ''}\`).join('\\n');
+        navigator.clipboard.writeText(text);
+        showMsg('已复制 ' + currentEditingIPs.length + ' 个IP');
+    }
+    
+    if(t.id === 'btn-save-edit') {
+        saveEditableFile();
+    }
+    
+    if(t.id === 'btn-cancel-edit' || t.classList.contains('close')) {
+        document.getElementById('edit-file-modal').style.display = 'none';
+        currentEditingFile = null;
+        currentEditingIPs = [];
+    }
+    
+    if(t.id === 'btn-save-edit-sources') {
+        const sources = {
+            urls: Array.from(document.querySelectorAll('.edit-url-cb:checked')).map(cb => parseInt(cb.value)),
+            apis: Array.from(document.querySelectorAll('.edit-api-cb:checked')).map(cb => parseInt(cb.value)),
+            files: Array.from(document.querySelectorAll('.edit-file-cb:checked')).map(cb => cb.value),
+            includeCustom: document.getElementById('edit-custom').checked
         };
-    }
-    async function doExtract(btn) {
-        btn.disabled=true; btn.innerText='⏳...';
-        document.getElementById('btn-copy-extract').style.display = 'none';
+        const autoUpdate = document.getElementById('edit-auto-update').checked;
+        t.disabled = true; t.innerText = '保存中...';
         try {
-            const res = await apiCall('/api/extract', 'POST', {sources: getSources('ext')});
-            lastExtractResult = res.ips; 
-            const resultEl = document.getElementById('extract-result');
-            resultEl.innerText = '✅ 提取 ' + res.count + ' 个:\\n---\\n' + res.ips.join('\\n');
-            if(res.count > 0) document.getElementById('btn-copy-extract').style.display = 'block';
-        } catch(e) { showMsg(e.message, 'error'); }
-        btn.disabled=false; btn.innerText='🚀 立即提取';
-    }
-    async function doSaveFile(btn) {
-        const name = document.getElementById('file-name').value; if(!name) return alert('请输入文件名');
-        btn.disabled=true; btn.innerText='⏳...';
-        try {
-            const res = await apiCall('/api/ipfiles', 'POST', {fileName:name, sources:getSources('file'), autoUpdate:document.getElementById('file-auto').checked});
-            if(res.meta) {
-                appData.ipFiles.push({...res.meta, stats: {total:0, today:0, lastAccess: null}});
-                render();
+            const res = await apiCall('/api/ipfiles', 'PATCH', { fileName: currentEditingFile, sources: sources, autoUpdate: autoUpdate });
+            if(res.success) {
+                showMsg('数据源已更新，文件已重新生成');
+                document.getElementById('edit-sources-modal').style.display = 'none';
+                const idx = appData.ipFiles.findIndex(f => f.name === currentEditingFile);
+                if(idx !== -1 && res.meta) { appData.ipFiles[idx] = {...appData.ipFiles[idx], ...res.meta}; render(); }
             }
-            showMsg('生成成功'); document.getElementById('file-name').value='';
-        } catch(e) { alert(e.message); }
-        btn.disabled=false; btn.innerText='💾 生成文件';
+        } catch(e) { showMsg(e.message, 'error'); } finally { t.disabled = false; t.innerText = '保存并重新生成'; }
     }
-    async function doTool(btn) {
-        const v = getLines('tool-input'); if(!v.length) return;
-        btn.disabled=true;
-        try {
-            const res = await apiCall('/api/tool_query', 'POST', {ipList:v});
-            const outputEl = document.getElementById('tool-output');
-            outputEl.style.display='block';
-            outputEl.innerText = res.results.map(x=>x.formatted).join('\\n');
-            document.getElementById('btn-tool-copy').style.display='inline-flex';
-        } catch(e) { showMsg(e.message, 'error'); }
-        btn.disabled=false;
+    
+    if(t.classList.contains('delete-ip-btn')) {
+        const index = parseInt(t.dataset.index);
+        currentEditingIPs.splice(index, 1);
+        renderEditableIPList();
     }
-  
+});
+
+document.getElementById('file-input').addEventListener('change', async function() {
+    if(!this.files.length) return;
+    const fd = new FormData(); fd.append('file', this.files[0]);
+    showMsg('上传中...', 'success');
+    try {
+        const res = await fetch('/api/upload', {method:'POST', body:fd});
+        const j = await res.json();
+        if(!res.ok) throw new Error(j.error || '上传失败');
+        if(!appData.uploadedFiles.includes(j.fileName)) { appData.uploadedFiles.push(j.fileName); render(); }
+        showMsg('上传成功: ' + j.fileName);
+    } catch(e) { showMsg(e.message, 'error'); }
+    this.value = '';
+});
+
+function escapeHtml(s) { return s ? s.toString().replace(/&/g,"&amp;").replace(/</g,"&lt;") : ''; }
+function getLines(id) { return document.getElementById(id).value.split('\\n').map(x=>x.trim()).filter(x=>x); }
+function showMsg(txt, type) {
+    if(!type) type = 'success';
+    const m = document.getElementById('message'); m.innerText=txt; m.className='message '+type; m.style.display='block';
+    setTimeout(()=>{ m.style.display='none'; }, 3000);
+}
+async function apiCall(u, m, d) {
+    const r = await fetch(u, {method:m, headers:{'Content-Type':'application/json'}, body:JSON.stringify(d)});
+    if(!r.ok) { const err = await r.json(); throw new Error(err.error || '请求失败'); }
+    return r.json();
+}
+
+function addSite(nameId, urlId, type) {
+    const n = document.getElementById(nameId).value;
+    const u = document.getElementById(urlId).value;
+    if(!n || !u) return alert('请填写完整');
+    appData.sitesList.push({name:n, url:u, type:type});
+    document.getElementById(nameId).value=''; document.getElementById(urlId).value='';
     render();
-  })();
-  </script>
-  </body>
-  </html>`;
-  }
+    apiCall('/api/sites', 'POST', {name:n, url:u, type:type});
+    showMsg('已添加链接');
+}
+
+function getSources(p) {
+    return {
+        urls: Array.from(document.querySelectorAll('.'+p+'-url-cb:checked')).map(x=>+x.value),
+        apis: Array.from(document.querySelectorAll('.'+p+'-api-cb:checked')).map(x=>+x.value),
+        files: Array.from(document.querySelectorAll('.'+p+'-file-cb:checked')).map(x=>x.value),
+        includeCustom: document.getElementById(p+'-custom').checked
+    };
+}
+
+async function doExtract(btn) {
+    btn.disabled=true; btn.innerText='⏳...';
+    document.getElementById('btn-copy-extract').style.display = 'none';
+    try {
+        const res = await apiCall('/api/extract', 'POST', {sources: getSources('ext')});
+        lastExtractResult = res.ips; 
+        const resultEl = document.getElementById('extract-result');
+        resultEl.innerText = '✅ 提取 ' + res.count + ' 个:\\n---\\n' + res.ips.join('\\n');
+        if(res.count > 0) document.getElementById('btn-copy-extract').style.display = 'block';
+    } catch(e) { showMsg(e.message, 'error'); }
+    btn.disabled=false; btn.innerText='🚀 立即提取';
+}
+
+async function doSaveFile(btn) {
+    const name = document.getElementById('file-name').value; if(!name) return alert('请输入文件名');
+    btn.disabled=true; btn.innerText='⏳...';
+    try {
+        const res = await apiCall('/api/ipfiles', 'POST', {fileName:name, sources:getSources('file'), autoUpdate:document.getElementById('file-auto').checked});
+        if(res.meta) { appData.ipFiles.push({...res.meta, stats: {total:0, today:0, lastAccess: null}}); render(); }
+        showMsg('生成成功'); document.getElementById('file-name').value='';
+    } catch(e) { alert(e.message); }
+    btn.disabled=false; btn.innerText='💾 生成文件';
+}
+
+async function doTool(btn) {
+    const v = getLines('tool-input'); if(!v.length) return;
+    const deduplicate = document.getElementById('tool-deduplicate').checked;
+    btn.disabled=true;
+    try {
+        const res = await apiCall('/api/tool_query', 'POST', {ipList:v, deduplicate: deduplicate});
+        const outputEl = document.getElementById('tool-output');
+        outputEl.style.display='block';
+        outputEl.innerText = res.results.map(x=>x.formatted).join('\\n');
+        document.getElementById('btn-tool-copy').style.display='inline-flex';
+        document.getElementById('btn-tool-save').style.display='inline-flex';
+        lastExtractResult = res.results.filter(x=>x.success).map(x=>x.formatted);
+    } catch(e) { showMsg(e.message, 'error'); }
+    btn.disabled=false;
+}
+
+function parseIPLine(line) {
+    const parts = line.split('#');
+    const ipPart = parts[0].trim();
+    const remark = parts.length > 1 ? parts.slice(1).join('#').trim() : '';
+    if (!ipPart) return null;
+    const ipPort = ipPart.split(':');
+    const ip = ipPort[0];
+    const port = ipPort.length > 1 ? ipPort[1] : '443';
+    const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    if (!ipv4Regex.test(ip)) return null;
+    return { ip, port, remark };
+}
+
+function parseBatchInput(text) {
+    const lines = text.split('\\n');
+    const results = [];
+    for(let line of lines) {
+        const p = parseIPLine(line.trim());
+        if(p) results.push(p);
+    }
+    return results;
+}
+
+function openEditModal() {
+    document.getElementById('edit-file-name').textContent = currentEditingFile;
+    document.getElementById('batch-ip-input').value = '';
+    renderEditableIPList();
+    document.getElementById('edit-file-modal').style.display = 'block';
+}
+
+function renderEditableIPList() {
+    document.getElementById('current-ip-count').innerText = currentEditingIPs.length;
+    const listEl = document.getElementById('editable-ip-list');
+    listEl.innerHTML = currentEditingIPs.map((ip, index) => {
+        const text = ip.port ? \`\${ip.ip}:\${ip.port}\${ip.remark ? '#' + ip.remark : ''}\` : \`\${ip.ip}\${ip.remark ? '#' + ip.remark : ''}\`;
+        return \`<div class="editable-ip-item">
+            <div class="editable-ip-text">\${escapeHtml(text)}</div>
+            <div class="editable-ip-actions">
+                <button class="btn-danger btn-small delete-ip-btn" data-index="\${index}">删除</button>
+            </div>
+        </div>\`;
+    }).join('');
+}
+
+async function saveEditableFile() {
+    if (!currentEditingFile || !currentEditingIPs.length) { showMsg('文件名或IP列表不能为空', 'error'); return; }
+    try {
+        const res = await apiCall('/api/editable_files', 'PUT', { fileName: currentEditingFile, ips: currentEditingIPs });
+        if (res.success) {
+            showMsg('文件保存成功');
+            document.getElementById('edit-file-modal').style.display = 'none';
+            const idx = appData.editableFiles.findIndex(f => f.name === currentEditingFile);
+            if (idx !== -1) {
+                appData.editableFiles[idx].ips = currentEditingIPs;
+                appData.editableFiles[idx].lastUpdate = new Date().toISOString();
+            } else {
+                appData.editableFiles.push({ name: currentEditingFile, editable: true, ips: currentEditingIPs, lastUpdate: new Date().toISOString(), stats: { total: 0, today: 0, lastAccess: null } });
+            }
+            render();
+        }
+    } catch(e) { showMsg(e.message, 'error'); }
+}
+
+async function saveToolResultAsEditable() {
+    if (!lastExtractResult.length) { showMsg('没有可保存的结果', 'error'); return; }
+    const fileName = prompt('请输入文件名:');
+    if (!fileName) return;
+    const ips = lastExtractResult.map(line => {
+        const parts = line.split('#');
+        const ipPart = parts[0].trim();
+        const remark = parts.length > 1 ? parts.slice(1).join('#').trim() : '';
+        const ipPort = ipPart.split(':');
+        const ip = ipPort[0];
+        const port = ipPort.length > 1 ? ipPort[1] : '443';
+        return { ip, port, remark };
+    });
+    try {
+        const res = await apiCall('/api/editable_files', 'POST', { fileName: fileName, ips: ips });
+        if (res.success) {
+            showMsg('保存成功');
+            appData.editableFiles.push({ name: fileName, editable: true, ips: ips, lastUpdate: new Date().toISOString(), stats: { total: 0, today: 0, lastAccess: null } });
+            render();
+        }
+    } catch(e) { showMsg(e.message, 'error'); }
+}
+
+render();
+})();
+</script>
+</body>
+</html>`;
+}
