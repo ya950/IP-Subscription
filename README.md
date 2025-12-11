@@ -1,2 +1,91 @@
-⚡️ Cloudflare Workers 节点管理系统 v10.7 部署教程📝 项目简介这是一个运行在 Cloudflare Workers 上的无服务器（Serverless）应用。它结合了 KV (用于缓存和会话) 和 R2 (用于存储大文件和配置)，提供了一个强大的 Web 界面来管理、提取、去重和转换各类代理节点 IP。v10.7 更新亮点缓存修复 (Critical): 彻底解决了编辑文件保存后，刷新页面列表消失的问题（通过强制 HTTP 响应头禁用浏览器缓存）。Base64 增强: 修复了部分订阅链接（特别是使用 URL-Safe Base64 编码，即包含 - 和 _ 字符）无法提取 IP 的 bug。逻辑优化: 优化了元数据同步机制，防止 R2 写入成功但索引未更新的情况。🛠 准备工作在开始之前，请确保你拥有一个 Cloudflare 账号。1. 创建 KV Namespace (键值存储)登录 Cloudflare Dashboard。进入 Workers & Pages -> KV。点击 Create a Namespace。名称输入：IP_NODES (建议大写，与代码一致)。点击 Add。2. 创建 R2 Bucket (对象存储)进入 R2 菜单。点击 Create Bucket。名称输入：node-files (或者自定义，但绑定变量名必须是 NODE_FILES)。点击 Create Bucket。注意： R2 有免费额度（每月 10GB 存储，100万次写操作），对于个人使用完全足够。🚀 部署步骤1. 创建 Worker进入 Workers & Pages -> Overview。点击 Create Worker。命名为 node-manager (或你喜欢的名字)。点击 Deploy (先部署一个默认的 Hello World)。点击 Edit code 进入代码编辑器。2. 粘贴代码将你提供的 v10.7 完整代码粘贴到编辑器中的 worker.js 文件中（覆盖原内容）。代码过长，请直接使用你上面提供的完整代码块。3. 配置变量绑定 (最关键的一步)在代码编辑器页面，点击左侧的 Settings (或者部署后去 Worker 的 Settings -> Variables)。你需要添加以下 环境变量 和 绑定：A. 环境变量 (Environment Variables)变量名示例值说明ADMIN_PASSWORDMySecretPass123必填。Web 管理界面的登录密码。TG_BOT_TOKEN123456:ABC-Def...(选填) Telegram 机器人 Token，用于发文件上传。TG_WHITELIST_ID123456789(选填) 你的 TG Chat ID，防止陌生人上传文件。B. KV Namespace Bindings向下滚动到 KV Namespace Bindings。点击 Add binding。Variable name: IP_NODES (必须完全一致)。KV Namespace: 选择你刚才创建的 IP_NODES。C. R2 Bucket Bindings向下滚动到 R2 Bucket Bindings。点击 Add binding。Variable name: NODE_FILES (必须完全一致)。R2 Bucket: 选择你刚才创建的 node-files。4. 部署与配置触发器点击右上角的 Deploy 保存并部署。(可选) 设置 Cron Triggers：如果你希望系统自动更新订阅文件，去 Worker 的 Settings -> Triggers。点击 Add Cron Trigger。设置为每 2 小时或每天执行一次 (例如 0 */2 * * *)。🤖 (可选) 配置 Telegram 机器人如果你配置了 TG_BOT_TOKEN，你需要设置 Webhook 才能让机器人接收文件。在浏览器中访问以下 URL（替换为你自己的信息）：https://api.telegram.org/bot<你的机器人TOKEN>/setWebhook?url=https://<你的WORKER域名>/api/tg_hook
-如果返回 Webhook was set，说明配置成功。现在你可以直接把 .txt 或 .csv 的 IP 文件发送给机器人，它会自动上传到系统。🖥 界面功能详解 (图文指引)部署完成后，访问你的 Worker 域名 (例如 https://node-manager.your-name.workers.dev)。1. 登录界面输入你在环境变量 ADMIN_PASSWORD 中设置的密码。2. 主控制台布局界面采用顶部 Tab 导航设计，v10.7 修复了缓存问题，操作更加流畅。🌐 Tab 1: IP 来源 (Sources)这是数据仓库，管理所有基础数据。📂 上传管理: 查看通过网页或 TG 机器人上传的本地文件。支持预览和删除。📡 订阅源: 添加各类机场订阅链接（支持 Base64、Clash、V2Ray 等格式）。v10.7 增强了对 vmess:// 中 URL-Safe Base64 的解析。🔗 API 源: 添加返回纯文本 IP 列表的 API 接口。📝 自定义 IP: 手动粘贴优质 IP 列表。🌐 找资源: 收藏常用的 IP 发布网站。🧪 Tab 2: 提取测试 (Extract)用于临时测试和组合数据。勾选左侧的来源（文件、订阅、API）。点击 🚀 立即提取。系统会自动去重、解析订阅、提取 IP，并在下方显示结果。📂 Tab 3: 文件生成 (Files) - 核心功能这里生成的链接是永久有效的，适合放入 Clash 或 V2Ray 中使用。输入文件名: 例如 best_cf。选择数据源: 勾选需要的 Upload 文件、可编辑文件或订阅源。自动更新: 勾选后，Cron 定时任务会每天自动重新拉取源数据并更新此文件。生成的链接:🔗 Workers链接: 动态读取，速度快。🚀 R2直链: 直接指向存储桶，适合高并发下载。✏️ Tab 4: 可编辑文件 (Editable)这是 v10.7 重点优化的模块。可以创建一个“虚拟文件”，在网页上直接编辑 IP 内容。v10.7 修复: 点击保存后，浏览器不再缓存旧列表，刷新页面立即显示最新修改。用途: 适合维护一个精选的手动 IP 列表，并将其作为 Tab 3 生成文件的“源”。🛠️ Tab 5: 查询工具 (Tools)批量查询: 粘贴一批 IP，系统会调用 Cloudflare 边缘网络查询 IP 的归属地（国家代码）。支持一键保存查询结果为“可编辑文件”。❓ 常见问题排查Q: 为什么保存了“可编辑文件”，刷新页面后文件又变回去了？A: 这是旧版本的 Bug。v10.7 已通过在 handleAdmin 中添加 Cache-Control: no-store 标头修复此问题。请确保你的代码已更新到 v10.7。Q: 某些 Base64 的订阅链接提取出来是乱码或为空？A: 检查订阅链接是否使用了 URL-Safe Base64 (将 + 替换为 -，/ 替换为 _)。v10.7 的 parseSubscription 函数已增加对此类编码的自动替换和 Padding 补全支持。Q: TG 机器人上传失败？A: 1. 检查 TG_FILE_LIMIT (默认 5MB)。 2. 确保你的 Worker 域名没有被墙（Telegram 服务器需要能访问你的 Worker）。 3. 确保执行了 setWebhook 操作。Q: 如何更新到此版本？A: 直接复制 v10.7 的代码，去 Cloudflare Dashboard 编辑 Worker，全选覆盖粘贴，然后点击 Deploy 即可。数据存储在 KV 和 R2 中，更新代码不会丢失数据。
+# ⚡️ Cloudflare Workers 节点管理系统 (v10.7)
+
+![Version](https://img.shields.io/badge/Version-v10.7-blue?style=flat-square)
+![Platform](https://img.shields.io/badge/Platform-Cloudflare%20Workers-orange?style=flat-square)
+![Storage](https://img.shields.io/badge/Storage-R2%20%2B%20KV-green?style=flat-square)
+
+这是一个基于 Cloudflare Workers + KV + R2 构建的无服务器（Serverless）代理节点管理系统。它提供了一个功能强大的 Web 界面，用于聚合、提取、去重、测试和管理您的节点订阅。
+
+**v10.7 版本重点修复了浏览器缓存导致的文件回滚问题，并增强了对 URL-Safe Base64 的解码支持。**
+
+## 📸 界面预览
+
+> *建议在此处放置您的项目截图，例如：控制台首页、提取页面、文件生成页面。*
+
+| 主控制台 / 数据源管理 | 提取与测试 |
+| :---: | :---: |
+| ![Dashboard](https://via.placeholder.com/600x400?text=Dashboard+Screenshot) | ![Extract](https://via.placeholder.com/600x400?text=Extract+Preview) |
+
+## ✨ 核心功能
+
+* **多源聚合**: 支持订阅链接、API 接口、自定义文本、本地文件上传（支持 CSV/TXT）等多种数据源。
+* **智能提取**:
+    * 支持解析 Vmess, Vless, Trojan, SS, SSR 等多种协议。
+    * **v10.7 增强**: 深度优化 Base64 解码，支持 URL-Safe 字符 (`-`, `_`)，解决部分机场订阅无法识别的问题。
+* **文件管理 (R2)**:
+    * 利用 Cloudflare R2 存储生成的订阅文件，支持大文件和高并发访问。
+    * 提供 **可编辑文件** 功能，可在网页端直接编辑 IP 列表，实时保存（**v10.7 修复了缓存回滚 Bug**）。
+* **自动更新**: 集成 Cron Triggers，支持定时自动拉取订阅源并更新目标文件。
+* **查询工具**: 内置 IP 归属地查询工具，支持批量去重和国家代码检测。
+* **Telegram 机器人**:
+    * 支持直接向机器人发送 `.txt` 或 `.csv` 文件进行自动上传。
+    * 简单的权限验证机制。
+
+## 📝 v10.7 更新日志
+
+1.  **[修复] 缓存问题**: 彻底解决了可编辑文件保存后，因浏览器强缓存导致刷新页面时列表回退、文件“消失”的严重 Bug。
+2.  **[修复] Base64 增强**: 重写了解析逻辑，完美支持 URL-Safe Base64 编码，修复了部分加密订阅源无法提取 IP 的问题。
+3.  **[优化] 元数据同步**: 优化了 R2 存储与 KV 索引之间的同步逻辑，防止数据不一致。
+
+## 🛠 部署教程
+
+### 1. 准备工作
+* 一个 Cloudflare 账号。
+* 开通 Workers、KV 和 R2 服务（免费额度足够个人使用）。
+
+### 2. 创建资源
+1.  **KV Namespace**:
+    * 创建一个名为 `IP_NODES` 的 KV 命名空间。
+2.  **R2 Bucket**:
+    * 创建一个名为 `node-files` 的存储桶。
+
+### 3. 部署 Worker
+1.  在 Cloudflare Dashboard 创建一个新的 Worker。
+2.  将本项目 `worker.js` 的所有代码复制并覆盖到编辑器中。
+3.  **绑定变量** (Settings -> Variables):
+
+    | 变量类型 | 变量名称 (Variable Name) | 对应值/资源 | 说明 |
+    | :--- | :--- | :--- | :--- |
+    | **KV Namespace** | `IP_NODES` | 选择你创建的 `IP_NODES` | **必须一致** |
+    | **R2 Bucket** | `NODE_FILES` | 选择你创建的 `node-files` | **必须一致** |
+    | **Environment Variable** | `ADMIN_PASSWORD` | `设置你的登录密码` | **必填** |
+    | **Environment Variable** | `TG_BOT_TOKEN` | `123456:ABC-Def...` | (选填) TG Bot Token |
+    | **Environment Variable** | `TG_WHITELIST_ID` | `123456789` | (选填) 你的 TG Chat ID |
+
+4.  点击 **Deploy** 部署。
+
+### 4. 配置定时任务 (可选)
+如果需要订阅自动更新功能，请在 Worker 的 **Triggers** -> **Cron Triggers** 中添加触发器：
+* 建议频率: `0 */2 * * *` (每2小时执行一次)
+
+### 5. 配置 Telegram Webhook (可选)
+如果你配置了 `TG_BOT_TOKEN`，请在浏览器访问以下 URL 以激活机器人文件接收功能：
+
+https://api.telegram.org/bot<你的Token>/setWebhook?url=https://<你的Worker域名>/api/tg_hook
+
+## 🖥 使用说明
+
+1.  访问你的 Worker 域名 (e.g., `https://xxx.workers.dev/admin`)。
+2.  输入环境变量中设置的 `ADMIN_PASSWORD` 进行登录。
+3.  **添加订阅**: 在“IP来源”页签添加你的机场订阅链接。
+4.  **生成文件**: 在“文件生成”页签，勾选需要的订阅源，设置文件名（如 `my_subs`），点击生成。
+5.  **获取链接**: 生成成功后，你将获得一个 **Workers 链接** (动态) 和一个 **R2 直链** (静态)，均可导入 Clash 或 V2Ray 使用。
+
+## ⚠️ 免责声明
+
+* 本项目仅供技术研究和学习使用。
+* 请勿用于任何违反当地法律法规的用途。
+* 开发者不对使用本项目产生的任何后果负责。
+
+---
+**如果觉得这个项目对你有帮助，欢迎点个 Star ⭐️！**
