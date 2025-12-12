@@ -1,8 +1,11 @@
-// 优选IP系统 v10.9 交互 优化版
+// Cloudflare Workers 节点管理系统 v10.8 (界面现代化版)
 // ==========================================
-// 更新日志 v10.9:
-// 1. [交互] 工具栏布局改为左对齐，选项紧挨着全选/反选按钮
-// 2. [UI] 增加了工具栏内部的垂直分隔线，区分操作区和选项区
+// 更新日志 v10.8:
+// 1. [优化] 全面现代化界面设计，采用更现代的配色和布局
+// 2. [调整] 将"包含自定义 IP 池"选项移到提取测试的反选按钮旁边
+// 3. [调整] 将"包含自定义IP"和"自动更新"选项移到文件生成的反选按钮旁边
+// 4. [增强] 添加更多微交互效果和动画
+// 5. [优化] 改进响应式设计，提升移动端体验
 // ==========================================
 
 const KV_BINDING_NAME = "IP_NODES"; 
@@ -282,11 +285,10 @@ async function handleR2FileAccess(request, env, ctx, path) {
     const fileMeta = manifest[fileName];
     let content;
     if (fileMeta && fileMeta.editable) {
-       // 仍然允许通过直链访问，但UI层不展示
-      const editableData = await DataAccessLayer.getEditableFile(env, fileName);
-      if (editableData && editableData.ips) {
+       const editableData = await DataAccessLayer.getEditableFile(env, fileName);
+       if (editableData && editableData.ips) {
         content = editableData.ips.map(ip => ip.port ? `${ip.ip}:${ip.port}${ip.remark ? '#' + ip.remark : ''}` : `${ip.ip}${ip.remark ? '#' + ip.remark : ''}`).join('\n');
-      }
+       }
     } else {
       const object = await env[R2_BUCKET_NAME].get(`generated/${fileName}`);
       if (!object) return new Response('File not found in R2 (Generated)', { status: 404 });
@@ -305,7 +307,6 @@ async function handleIPFile(request, env, ctx, path) {
     const fileMeta = manifest[fileName];
     let content;
     if (fileMeta && fileMeta.editable) {
-      // 仍然允许访问，但UI不展示
       const editableData = await DataAccessLayer.getEditableFile(env, fileName);
       if (editableData && editableData.ips) {
         content = editableData.ips.map(ip => ip.port ? `${ip.ip}:${ip.port}${ip.remark ? '#' + ip.remark : ''}` : `${ip.ip}${ip.remark ? '#' + ip.remark : ''}`).join('\n');
@@ -443,6 +444,7 @@ async function getIPFiles(env) {
   const manifest = await DataAccessLayer.getManifest(env);
   const result = [];
   for (const [name, meta] of Object.entries(manifest)) {
+      if(!meta) continue;
       const stats = await DataAccessLayer.getStats(env, name);
       result.push({ ...meta, stats });
   }
@@ -541,7 +543,6 @@ async function deleteEditableFileAPI(req, env) {
   return new Response(JSON.stringify({ success: true, fileName }));
 }
 
-// 修复: 增加元数据缺失时的自动补全，防止文件消失
 async function updateEditableFile(req, env) {
   const b = await req.json();
   const { fileName, ips } = b;
@@ -553,7 +554,6 @@ async function updateEditableFile(req, env) {
   const manifest = await DataAccessLayer.getManifest(env);
   let meta = manifest[fileName];
   
-  // 安全检查：如果 meta 不存在（可能被手动删除了或同步失败），重新创建
   if (!meta) {
       meta = { name: fileName, editable: true, autoUpdate: false, sources: {}, lastUpdate: new Date().toISOString() };
   } else {
@@ -677,12 +677,10 @@ async function performExtraction(env, sources, forceRefresh = false) {
   
   if (sources.files && Array.isArray(sources.files)) {
       const filePromises = sources.files.map(async (fileName) => {
-          // 1. 先检查是否为上传文件
           if (uploadedFiles.includes(fileName)) {
               const content = await DataAccessLayer.readFile(env, 'upload', fileName);
               if (content) return IPExtractor.processBatch(content).map(r => ({...r, source: 'file'}));
           } 
-          // 2. 再检查是否为可编辑文件
           else {
               try {
                   const editableData = await DataAccessLayer.getEditableFile(env, fileName);
@@ -750,39 +748,30 @@ async function performExtraction(env, sources, forceRefresh = false) {
   return result;
 }
 
-// 修复: 增强版订阅解析 (支持 URL-Safe Base64)
 function parseSubscription(c) {
   const n = []; let d = c;
   try {
-      // 1. 去除所有空格
       let cleanStr = c.replace(/\s/g, '');
       
-      // 2. 只有当字符串看起来像Base64且不是明文URL时才尝试解码
       if (cleanStr.length > 20 && !cleanStr.includes('://')) {
-          // 3. 处理 URL-Safe Base64 (- -> +, _ -> /)
           cleanStr = cleanStr.replace(/-/g, '+').replace(/_/g, '/');
           
-          // 4. 补全 Padding
           while (cleanStr.length % 4) {
               cleanStr += '=';
           }
           
-          // 5. 解码 (使用 decodeURIComponent + escape 处理 UTF-8)
           d = decodeURIComponent(escape(atob(cleanStr)));
       }
   } catch (e) {
-      // 如果解码失败，假定原文就是明文列表，继续处理
       d = c;
   }
 
   d.split(/[\r\n]+/).forEach(l => {
     const t = l.trim(); if (!t) return;
     
-    // VMESS
     if (t.startsWith('vmess://')) { 
         try { 
             let base64 = t.substring(8); 
-            // 同样处理 vmess 内的 base64
             base64 = base64.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/');
             const jsonStr = decodeURIComponent(escape(atob(base64))); 
             const j = JSON.parse(jsonStr); 
@@ -791,7 +780,6 @@ function parseSubscription(c) {
         } catch (e) {} 
     }
     
-    // VLESS/TROJAN/SS
     if (t.match(/^(vless|trojan|ss):\/\//)) { 
         try { 
             const u = new URL(t); 
@@ -800,7 +788,6 @@ function parseSubscription(c) {
         } catch(e) {} 
     }
     
-    // 纯文本 IP
     const processed = IPExtractor.processBatch([t]);
     if (processed.length > 0) n.push(processed[0]);
   });
@@ -846,7 +833,7 @@ async function logout(req, env) { const c = req.headers.get('Cookie'); if(c) { c
 async function checkSession(req, env) { const c = req.headers.get('Cookie'); if(!c) return false; const id = c.match(/session=([^;]+)/)?.[1]; if(!id) return false; return await env[KV_BINDING_NAME].get(`session_${id}`) === 'valid'; }
 
 // ==========================================
-// 10. 管理页面 (UI 优化版)
+// 10. 管理页面 (现代化界面版)
 // ==========================================
 async function handleAdmin(req, env) {
   const url = new URL(req.url); 
@@ -879,7 +866,6 @@ async function handleAdmin(req, env) {
             const editableData = await DataAccessLayer.getEditableFile(env, name);
             editableFiles.push({ ...meta, stats, ips: editableData ? editableData.ips : [] });
         } catch(e) {
-            // 防止读取错误导致页面渲染失败，填充空数据
             editableFiles.push({ ...meta, stats, ips: [] });
         }
       } else { ipFiles.push({ ...meta, stats }); }
@@ -887,19 +873,20 @@ async function handleAdmin(req, env) {
   const jsonStr = JSON.stringify({ urls, apis, customIPs, uploadedFiles, ipFiles, editableFiles, sitesList });
   const base64Data = btoa(unescape(encodeURIComponent(jsonStr)));
   
-  // 关键修复: 添加 Cache-Control 禁止浏览器缓存管理页面，解决刷新后列表回退问题
   return new Response(getAdminPage(base64Data, url.origin), { 
       headers: { 
           'Content-Type': 'text/html; charset=utf-8',
-          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
           'Pragma': 'no-cache',
-          'Expires': '0'
+          'Expires': '0',
+          'Surrogate-Control': 'no-store',
+          'Last-Modified': new Date().toUTCString()
       } 
   });
 }
 
 function getLoginPage(error = '') {
-    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>系统登录</title><style>:root{--primary:#6366f1;--bg:#f3f4f6;--surface:#ffffff;--text:#1f2937}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.login-box{background:var(--surface);padding:2.5rem;border-radius:1rem;box-shadow:0 10px 25px -5px rgba(0,0,0,0.1);width:100%;max-width:360px;text-align:center}h2{margin-bottom:1.5rem;color:var(--text);font-weight:700}input{width:100%;padding:.75rem 1rem;margin-bottom:1rem;border:1px solid #e5e7eb;border-radius:.5rem;font-size:1rem;box-sizing:border-box;outline:none;transition:all .2s}input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,0.2)}button{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.5rem;font-size:1rem;font-weight:600;cursor:pointer;transition:background .2s}button:hover{background:#4f46e5}.error{background:#fee2e2;color:#991b1b;padding:.75rem;border-radius:.5rem;margin-top:1rem;font-size:.875rem}</style></head><body><div class="login-box"><h2>🔒 IP管理系统 v10.7</h2><form method="POST" action="?action=login"><input type="password" name="password" placeholder="请输入访问密码" required autofocus><button type="submit">立即登录</button>${error?`<div class="error">${error}</div>`:''}</form></div></body></html>`;
+    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>系统登录</title><style>:root{--primary:#6366f1;--bg:#f3f4f6;--surface:#ffffff;--text:#1f2937}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.login-box{background:var(--surface);padding:2.5rem;border-radius:1rem;box-shadow:0 20px 25px -5px rgba(0,0,0,0.1),0 10px 10px -5px rgba(0,0,0,0.04);width:100%;max-width:360px;text-align:center;backdrop-filter:blur(10px);background:rgba(255,255,255,0.95)}h2{margin-bottom:1.5rem;color:var(--text);font-weight:700;font-size:1.5rem}input{width:100%;padding:.75rem 1rem;margin-bottom:1rem;border:1px solid #e5e7eb;border-radius:.5rem;font-size:1rem;box-sizing:border-box;outline:none;transition:all .2s;background:rgba(255,255,255,0.9)}input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,0.2)}button{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.5rem;font-size:1rem;font-weight:600;cursor:pointer;transition:all .2s;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1)}button:hover{background:#4f46e5;transform:translateY(-2px);box-shadow:0 10px 15px -3px rgba(0,0,0,0.1)}.error{background:#fee2e2;color:#991b1b;padding:.75rem;border-radius:.5rem;margin-top:1rem;font-size:.875rem}</style></head><body><div class="login-box"><h2>🔒 节点管理系统 v10.8</h2><form method="POST" action="?action=login"><input type="password" name="password" placeholder="请输入访问密码" required autofocus><button type="submit">立即登录</button>${error?`<div class="error">${error}</div>`:''}</form></div></body></html>`;
 }
 
 function getAdminPage(base64Data, origin) {
@@ -910,120 +897,622 @@ function getAdminPage(base64Data, origin) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>节点 IP 管理控制台 v10.7 </title>
+<title>节点 IP 管理控制台 v10.8 (现代化界面)</title>
 <style>
-    :root { --primary: #4f46e5; --primary-hover: #4338ca; --danger: #ef4444; --danger-hover: #dc2626; --success: #10b981; --warning: #f59e0b; --bg: #f3f4f6; --surface: #ffffff; --text-main: #111827; --text-sub: #6b7280; --border: #e5e7eb; --radius: 0.5rem; }
+    :root { 
+        --primary: #6366f1; 
+        --primary-hover: #4f46e5; 
+        --primary-light: #e0e7ff;
+        --danger: #ef4444; 
+        --danger-hover: #dc2626; 
+        --danger-light: #fee2e2;
+        --success: #10b981; 
+        --success-light: #d1fae5;
+        --warning: #f59e0b; 
+        --warning-light: #fef3c7;
+        --bg: #f8fafc; 
+        --surface: #ffffff; 
+        --text-main: #1e293b; 
+        --text-sub: #64748b; 
+        --border: #e2e8f0; 
+        --radius: 0.75rem; 
+        --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+        --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        --gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text-main); line-height: 1.5; padding-bottom: 2rem; font-size: 14px; }
-    .container { max-width: 1100px; margin: 0 auto; padding: 0 1rem; }
-    header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; margin-bottom: 1rem; }
-    h1 { font-size: 1.4rem; font-weight: 800; background: linear-gradient(to right, #4f46e5, #ec4899); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .logout { font-size: 0.85rem; color: var(--text-sub); text-decoration: none; cursor: pointer; display: flex; align-items: center; gap: 4px; }
-    .logout:hover { color: var(--danger); }
-    .message { position: fixed; top: 20px; right: 20px; padding: 0.8rem 1.2rem; border-radius: var(--radius); background: var(--surface); box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); display: none; z-index: 100; border-left: 4px solid var(--primary); font-weight: 500; }
-    .message.success { border-color: var(--success); color: #065f46; background: #d1fae5; }
-    .message.error { border-color: var(--danger); color: #991b1b; background: #fee2e2; }
-    
-    /* Tabs */
-    .tabs { display: flex; gap: 0.4rem; margin-bottom: 1rem; overflow-x: auto; padding-bottom: 2px; }
-    .tab { padding: 0.5rem 1rem; background: transparent; border: none; border-radius: 2rem; cursor: pointer; color: var(--text-sub); font-weight: 600; font-size: 0.9rem; white-space: nowrap; transition: all 0.2s; }
-    .tab:hover { background: #e0e7ff; color: var(--primary); }
-    .tab.active { background: var(--primary); color: white; box-shadow: 0 2px 8px rgba(79, 70, 229, 0.3); }
-    .tab-content { display: none; background: var(--surface); border-radius: var(--radius); padding: 1.5rem; box-shadow: 0 2px 4px -1px rgba(0,0,0,0.05); border: 1px solid var(--border); animation: fadeIn 0.2s ease; }
+    body { 
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; 
+        background: var(--bg); 
+        color: var(--text-main); 
+        line-height: 1.6; 
+        min-height: 100vh;
+        background-image: 
+            radial-gradient(circle at 20% 80%, rgba(99, 102, 241, 0.1) 0%, transparent 50%),
+            radial-gradient(circle at 80% 20%, rgba(139, 92, 246, 0.1) 0%, transparent 50%),
+            radial-gradient(circle at 40% 40%, rgba(236, 72, 153, 0.05) 0%, transparent 50%);
+    }
+    .container { max-width: 1200px; margin: 0 auto; padding: 0 1rem; }
+    header { 
+        display: flex; 
+        justify-content: space-between; 
+        align-items: center; 
+        padding: 2rem 0; 
+        margin-bottom: 2rem; 
+        border-bottom: 1px solid var(--border);
+    }
+    h1 { 
+        font-size: 1.875rem; 
+        font-weight: 800; 
+        background: var(--gradient); 
+        -webkit-background-clip: text; 
+        -webkit-text-fill-color: transparent;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .logout { 
+        font-size: 0.875rem; 
+        color: var(--text-sub); 
+        text-decoration: none; 
+        cursor: pointer; 
+        display: flex; 
+        align-items: center; 
+        gap: 0.5rem;
+        padding: 0.5rem 1rem;
+        border-radius: 0.5rem;
+        transition: all 0.2s;
+    }
+    .logout:hover { 
+        color: var(--danger); 
+        background: var(--danger-light);
+    }
+    .message { 
+        position: fixed; 
+        top: 20px; 
+        right: 20px; 
+        padding: 1rem 1.5rem; 
+        border-radius: var(--radius); 
+        background: var(--surface); 
+        box-shadow: var(--shadow-lg); 
+        display: none; 
+        z-index: 1000; 
+        border-left: 4px solid var(--primary); 
+        font-weight: 500;
+        animation: slideIn 0.3s ease;
+    }
+    @keyframes slideIn {
+        from { transform: translateX(100%); opacity: 0; }
+        to { transform: translateX(0); opacity: 1; }
+    }
+    .message.success { border-color: var(--success); color: #065f46; background: var(--success-light); }
+    .message.error { border-color: var(--danger); color: #991b1b; background: var(--danger-light); }
+    .tabs { 
+        display: flex; 
+        gap: 0.5rem; 
+        margin-bottom: 2rem; 
+        overflow-x: auto; 
+        padding: 0.25rem;
+        background: var(--surface);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        flex-wrap: wrap;
+    }
+    .tab { 
+        padding: 0.75rem 1.5rem; 
+        background: transparent; 
+        border: none; 
+        border-radius: 0.5rem; 
+        cursor: pointer; 
+        color: var(--text-sub); 
+        font-weight: 600; 
+        font-size: 0.95rem; 
+        white-space: nowrap; 
+        transition: all 0.2s; 
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .tab:hover { 
+        background: var(--primary-light); 
+        color: var(--primary); 
+        transform: translateY(-1px);
+    }
+    .tab.active { 
+        background: var(--primary); 
+        color: white; 
+        box-shadow: var(--shadow);
+    }
+    .tab-content { 
+        display: none; 
+        background: var(--surface); 
+        border-radius: var(--radius); 
+        padding: 2rem; 
+        box-shadow: var(--shadow-lg); 
+        animation: fadeIn 0.3s ease; 
+    }
     .tab-content.active { display: block; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-
-    /* UI Components */
-    h2 { font-size: 1.1rem; margin-bottom: 1rem; color: var(--text-main); font-weight: 700; border-left: 3px solid var(--primary); padding-left: 10px; display: flex; align-items: center; height: 1.4rem; }
-    .form-group { margin-bottom: 1rem; }
-    textarea, input[type="text"] { width: 100%; padding: 0.6rem; border: 1px solid var(--border); border-radius: 0.4rem; background: #f9fafb; outline: none; font-family: monospace; font-size: 0.85rem; transition: border 0.2s; }
-    textarea:focus, input[type="text"]:focus { border-color: var(--primary); background: #fff; box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.1); }
-    
-    /* Buttons */
-    button { padding: 0.5rem 1rem; border: none; border-radius: 0.4rem; cursor: pointer; font-weight: 500; font-size: 0.85rem; transition: all 0.15s; display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
-    button:active { transform: scale(0.98); }
-    button:disabled { opacity: 0.6; cursor: not-allowed; filter: grayscale(100%); }
-    .btn-primary { background: var(--primary); color: white; } .btn-primary:hover { background: var(--primary-hover); }
-    .btn-success { background: var(--success); color: white; } .btn-success:hover { filter: brightness(90%); }
-    .btn-danger { background: #fee2e2; color: var(--danger); } .btn-danger:hover { background: #fecaca; }
-    .btn-warning { background: #fef3c7; color: #b45309; } .btn-warning:hover { background: #fde68a; }
-    .btn-secondary { background: #e5e7eb; color: var(--text-main); } .btn-secondary:hover { background: #d1d5db; }
-    .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.75rem; }
-
-    /* Compact List Items */
-    .item-list { margin-top: 1rem; display: flex; flex-direction: column; gap: 0.5rem; }
-    .item { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: #f9fafb; border: 1px solid var(--border); border-radius: 0.4rem; transition: border 0.2s; }
-    .item:hover { border-color: #cbd5e1; }
-    .item-content { flex: 1; word-break: break-all; margin-right: 1rem; font-family: monospace; font-size: 0.85rem; color: #374151; }
-    
-    /* Badges */
-    .item-meta { font-size: 0.75rem; color: var(--text-sub); margin-top: 3px; display: flex; gap: 8px; align-items: center;}
-    .badge { padding: 1px 6px; border-radius: 4px; background: #e5e7eb; font-size: 0.7rem; font-weight: 600; }
-    .badge.auto { background: #d1fae5; color: #065f46; }
-    .badge.editable { background: #ddd6fe; color: #5b21b6; }
-    .src-badge { display: inline-block; padding: 1px 5px; margin: 1px; border-radius: 3px; font-size: 0.7rem; background: #e5e7eb; color: #4b5563; border: 1px solid #d1d5db; }
-    .src-badge.custom { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
-    .src-badge.file { background: #dbeafe; color: #1e40af; border-color: #bfdbfe; }
-    .src-badge.sub { background: #d1fae5; color: #065f46; border-color: #a7f3d0; }
-    .src-badge.api { background: #fef3c7; color: #b45309; border-color: #fde68a; }
-
-    /* Compact Checkbox Group (优化过) */
-    .checkbox-group { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px; padding: 8px; background: #f9fafb; border-radius: 0.4rem; border: 1px solid var(--border); max-height: 350px; overflow-y: auto; }
-    .checkbox-group label { margin: 0; display: flex; align-items: center; cursor: pointer; padding: 4px 6px; border-radius: 4px; font-size: 0.8rem; border: 1px solid transparent; transition: all 0.1s; }
-    .checkbox-group label:hover { background: #eef2ff; border-color: #c7d2fe; color: var(--primary); }
-    .checkbox-group input { margin-right: 6px; accent-color: var(--primary); width: 14px; height: 14px; }
-    
-    /* Toolbar (新功能: 左对齐 + 紧凑布局) */
-    .tool-bar { display: flex; align-items: center; justify-content: flex-start; background: #fff; padding: 8px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 0.4rem; flex-wrap: wrap; gap: 15px; }
-    .tool-check { display: flex; align-items: center; gap: 5px; font-size: 0.85rem; cursor: pointer; margin: 0; user-select: none; color: #374151; font-weight: 500; }
-    .tool-check input { width: 15px; height: 15px; accent-color: var(--primary); }
-    .vt-divider { width: 1px; height: 18px; background: #e5e7eb; margin: 0 2px; }
-
-    /* Upload Area */
-    .upload-area { border: 2px dashed #cbd5e1; border-radius: 0.5rem; padding: 1.5rem; text-align: center; background: #fff; cursor: pointer; transition: all 0.2s; }
-    .upload-area:hover { border-color: var(--primary); background: #eff6ff; }
-    pre { background: #1f2937; color: #e5e7eb; padding: 0.8rem; border-radius: 0.4rem; font-size: 0.8rem; max-height: 400px; overflow-y: auto; margin-top: 1rem; border: 1px solid #374151; white-space: pre-wrap; word-wrap: break-word; }
-    
-    /* Sub Tabs */
-    .sub-tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); }
-    .sub-tab { padding: 0.5rem 0.8rem; background: transparent; border: none; border-bottom: 2px solid transparent; cursor: pointer; color: var(--text-sub); font-weight: 600; font-size: 0.85rem; transition: all 0.2s; }
-    .sub-tab:hover { color: var(--primary); }
-    .sub-tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+    @keyframes fadeIn { 
+        from { opacity: 0; transform: translateY(10px); } 
+        to { opacity: 1; transform: translateY(0); } 
+    }
+    h2 { 
+        font-size: 1.5rem; 
+        margin-bottom: 1.5rem; 
+        color: var(--text-main); 
+        font-weight: 700; 
+        border-left: 4px solid var(--primary); 
+        padding-left: 1rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .form-group { margin-bottom: 1.5rem; }
+    textarea, input[type="text"] { 
+        width: 100%; 
+        padding: 0.875rem; 
+        border: 1px solid var(--border); 
+        border-radius: 0.5rem; 
+        background: #f8fafc; 
+        outline: none; 
+        font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+        font-size: 0.875rem;
+        transition: all 0.2s;
+    }
+    textarea:focus, input[type="text"]:focus { 
+        border-color: var(--primary); 
+        background: white; 
+        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1); 
+    }
+    button { 
+        padding: 0.75rem 1.5rem; 
+        border: none; 
+        border-radius: 0.5rem; 
+        cursor: pointer; 
+        font-weight: 600; 
+        font-size: 0.9rem; 
+        transition: all 0.2s; 
+        display: inline-flex; 
+        align-items: center; 
+        justify-content: center; 
+        gap: 0.5rem;
+        box-shadow: var(--shadow);
+    }
+    button:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-lg);
+    }
+    button:active {
+        transform: translateY(0);
+    }
+    button:disabled { 
+        opacity: 0.6; 
+        cursor: not-allowed; 
+        filter: grayscale(100%); 
+        transform: none !important;
+    }
+    .btn-primary, .btn-success { 
+        background: var(--primary); 
+        color: white; 
+    }
+    .btn-primary:hover, .btn-success:hover { 
+        background: var(--primary-hover); 
+    }
+    .btn-danger { 
+        background: var(--danger); 
+        color: white; 
+    }
+    .btn-danger:hover { 
+        background: var(--danger-hover); 
+    }
+    .btn-warning { 
+        background: var(--warning); 
+        color: white; 
+    }
+    .btn-warning:hover { 
+        background: #d97706; 
+    }
+    .btn-secondary { 
+        background: var(--text-sub); 
+        color: white; 
+    }
+    .btn-secondary:hover { 
+        background: #475569; 
+    }
+    .item-list { 
+        margin-top: 1.5rem; 
+        display: flex; 
+        flex-direction: column; 
+        gap: 1rem; 
+    }
+    .item { 
+        display: flex; 
+        justify-content: space-between; 
+        align-items: center; 
+        padding: 1.25rem; 
+        background: #f8fafc; 
+        border: 1px solid var(--border); 
+        border-radius: 0.75rem; 
+        transition: all 0.2s; 
+        box-shadow: var(--shadow);
+    }
+    .item:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-lg);
+        border-color: var(--primary);
+    }
+    .item-content { 
+        flex: 1; 
+        word-break: break-all; 
+        margin-right: 1rem; 
+        font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+        font-size: 0.875rem; 
+        color: var(--text-main); 
+    }
+    .item-meta { 
+        font-size: 0.75rem; 
+        color: var(--text-sub); 
+        margin-top: 0.5rem; 
+        display: flex; 
+        gap: 1rem; 
+        align-items: center;
+        flex-wrap: wrap;
+    }
+    .badge { 
+        padding: 0.25rem 0.75rem; 
+        border-radius: 9999px; 
+        background: var(--primary-light); 
+        font-size: 0.75rem; 
+        font-weight: 600; 
+        color: var(--primary);
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    .badge.auto { background: var(--success-light); color: #065f46; }
+    .badge.editable { background: #e9d5ff; color: #6b21a8; }
+    .src-badge { 
+        display: inline-block; 
+        padding: 0.25rem 0.5rem; 
+        margin: 0.25rem; 
+        border-radius: 0.375rem; 
+        font-size: 0.75rem; 
+        background: var(--primary-light); 
+        color: var(--primary); 
+        border: 1px solid var(--primary);
+        font-weight: 500;
+    }
+    .src-badge.custom { background: var(--danger-light); color: var(--danger); border-color: var(--danger); }
+    .src-badge.file { background: #dbeafe; color: #1e40af; border-color: #3b82f6; }
+    .src-badge.sub { background: var(--success-light); color: #065f46; border-color: var(--success); }
+    .src-badge.api { background: var(--warning-light); color: #92400e; border-color: var(--warning); }
+    .checkbox-group { 
+        display: grid; 
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); 
+        gap: 1rem; 
+        margin-top: 1rem; 
+        padding: 1.5rem; 
+        background: #f8fafc; 
+        border-radius: 0.75rem; 
+        border: 1px solid var(--border);
+        max-height: 300px;
+        overflow-y: auto;
+    }
+    .checkbox-group label { 
+        margin: 0; 
+        display: flex; 
+        align-items: center; 
+        cursor: pointer; 
+        padding: 0.75rem; 
+        border-radius: 0.5rem; 
+        font-size: 0.875rem;
+        transition: all 0.2s;
+    }
+    .checkbox-group label:hover { 
+        background: var(--primary-light); 
+        transform: translateX(4px);
+    }
+    .checkbox-group input { 
+        margin-right: 0.75rem; 
+        accent-color: var(--primary); 
+        width: 1.25rem; 
+        height: 1.25rem; 
+    }
+    .upload-area { 
+        border: 2px dashed #cbd5e1; 
+        border-radius: 0.75rem; 
+        padding: 3rem; 
+        text-align: center; 
+        background: #f8fafc; 
+        cursor: pointer; 
+        transition: all 0.2s;
+    }
+    .upload-area:hover { 
+        border-color: var(--primary); 
+        background: var(--primary-light); 
+        transform: scale(1.02);
+    }
+    pre { 
+        background: #1e293b; 
+        color: #e2e8f0; 
+        padding: 1.5rem; 
+        border-radius: 0.75rem; 
+        font-size: 0.875rem; 
+        max-height: 400px; 
+        overflow-y: auto; 
+        margin-top: 1rem; 
+        border: 1px solid #334155; 
+        white-space: pre-wrap; 
+        word-wrap: break-word;
+        box-shadow: var(--shadow);
+    }
+    .sub-tabs { 
+        display: flex; 
+        gap: 0.5rem; 
+        margin-bottom: 1.5rem; 
+        border-bottom: 2px solid var(--border); 
+        padding-bottom: 0;
+    }
+    .sub-tab { 
+        padding: 0.75rem 1.5rem; 
+        background: transparent; 
+        border: none; 
+        border-bottom: 3px solid transparent; 
+        cursor: pointer; 
+        color: var(--text-sub); 
+        font-weight: 600; 
+        font-size: 0.9rem; 
+        transition: all 0.2s; 
+        border-radius: 0.5rem 0.5rem 0 0;
+    }
+    .sub-tab:hover { 
+        color: var(--primary); 
+        background: var(--primary-light);
+    }
+    .sub-tab.active { 
+        color: var(--primary); 
+        border-bottom-color: var(--primary); 
+        background: var(--primary-light);
+    }
     .sub-tab-content { display: none; }
     .sub-tab-content.active { display: block; }
-    
-    /* Layouts */
-    .tools-layout { display: grid; grid-template-columns: 1fr 280px; gap: 15px; }
-    .tools-sidebar { background: #f9fafb; padding: 1rem; border-radius: var(--radius); border: 1px solid var(--border); }
-    .link-card { display: block; padding: 8px; margin-bottom: 6px; background: white; border: 1px solid var(--border); border-radius: 4px; text-decoration: none; color: var(--text-main); font-size: 0.85rem; display: flex; align-items: center; transition: all 0.2s; }
-    .link-card:hover { border-color: var(--primary); color: var(--primary); transform: translateX(2px); }
-    
-    /* Modal */
-    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); z-index: 1000; backdrop-filter: blur(2px); }
-    .modal-content { background-color: var(--surface); margin: 3% auto; padding: 1.5rem; border-radius: var(--radius); width: 90%; max-width: 800px; max-height: 85vh; overflow-y: auto; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1); }
-    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); }
-    .modal-title { font-size: 1.1rem; font-weight: 700; color: var(--text-main); }
-    .close { color: var(--text-sub); font-size: 1.5rem; font-weight: bold; cursor: pointer; line-height: 1; }
-    .close:hover { color: var(--danger); }
-    .edit-section { margin-bottom: 1.2rem; }
-    .edit-section h3 { font-size: 0.95rem; margin-bottom: 0.6rem; color: var(--text-main); border-left: 3px solid var(--primary); padding-left: 8px; }
-    .stats-info { display: flex; gap: 12px; align-items: center; font-size: 0.75rem; color: var(--text-sub); }
-    .stats-info span { display: flex; align-items: center; gap: 3px; }
-    .editable-ip-list { max-height: 250px; overflow-y: auto; border: 1px solid var(--border); border-radius: 0.4rem; padding: 0.4rem; margin-bottom: 0.8rem; background: #fff; }
-    .editable-ip-item { display: flex; justify-content: space-between; align-items: center; padding: 0.4rem 0.6rem; margin-bottom: 0.3rem; background: #f9fafb; border-radius: 0.3rem; border: 1px solid transparent; }
-    .editable-ip-item:hover { border-color: #e5e7eb; background: #f3f4f6; }
-    .editable-ip-text { font-family: monospace; font-size: 0.8rem; flex: 1; margin-right: 0.5rem; color: #4b5563; }
-    .ip-add-actions { display: flex; gap: 8px; margin-top: 5px; }
-    
-    @media (max-width: 800px) { .tools-layout { grid-template-columns: 1fr; } .tool-bar { gap: 10px; } }
-    @media (max-width: 640px) { .container { padding: 0 0.5rem; } .tab { padding: 0.4rem 0.8rem; font-size: 0.8rem; } .tab-content { padding: 1rem; } .item { flex-direction: column; align-items: flex-start; gap: 8px; } .item button { width: 100%; } }
+    .tools-layout { 
+        display: grid; 
+        grid-template-columns: 1fr 320px; 
+        gap: 2rem; 
+    }
+    .tools-sidebar { 
+        background: #f8fafc; 
+        padding: 1.5rem; 
+        border-radius: var(--radius); 
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow);
+        height: fit-content;
+    }
+    .link-card { 
+        display: block; 
+        padding: 0.75rem 1rem; 
+        margin-bottom: 0.75rem; 
+        background: white; 
+        border: 1px solid var(--border); 
+        border-radius: 0.5rem; 
+        text-decoration: none; 
+        color: var(--text-main); 
+        font-size: 0.9rem; 
+        display: flex; 
+        align-items: center; 
+        transition: all 0.2s; 
+        box-shadow: var(--shadow);
+    }
+    .link-card:hover { 
+        border-color: var(--primary); 
+        color: var(--primary); 
+        transform: translateX(4px);
+        box-shadow: var(--shadow-lg);
+    }
+    .modal { 
+        display: none; 
+        position: fixed; 
+        top: 0; 
+        left: 0; 
+        width: 100%; 
+        height: 100%; 
+        background-color: rgba(0,0,0,0.5); 
+        z-index: 1000; 
+        backdrop-filter: blur(4px);
+    }
+    .modal-content { 
+        background-color: var(--surface); 
+        margin: 5% auto; 
+        padding: 2rem; 
+        border-radius: var(--radius); 
+        width: 90%; 
+        max-width: 800px; 
+        max-height: 80vh; 
+        overflow-y: auto; 
+        box-shadow: var(--shadow-lg);
+        animation: modalFadeIn 0.3s ease;
+    }
+    @keyframes modalFadeIn {
+        from { opacity: 0; transform: scale(0.95); }
+        to { opacity: 1; transform: scale(1); }
+    }
+    .modal-header { 
+        display: flex; 
+        justify-content: space-between; 
+        align-items: center; 
+        margin-bottom: 1.5rem; 
+        padding-bottom: 1rem;
+        border-bottom: 1px solid var(--border);
+    }
+    .modal-title { 
+        font-size: 1.25rem; 
+        font-weight: 700; 
+        color: var(--text-main); 
+    }
+    .close { 
+        color: var(--text-sub); 
+        font-size: 1.5rem; 
+        font-weight: bold; 
+        cursor: pointer; 
+        width: 2rem;
+        height: 2rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 0.5rem;
+        transition: all 0.2s;
+    }
+    .close:hover { 
+        color: var(--danger); 
+        background: var(--danger-light);
+    }
+    .modal-body { 
+        margin-bottom: 1.5rem; 
+    }
+    .modal-footer { 
+        display: flex; 
+        justify-content: flex-end; 
+        gap: 1rem; 
+        padding-top: 1.5rem;
+        border-top: 1px solid var(--border);
+    }
+    .edit-section { 
+        margin-bottom: 1.5rem; 
+    }
+    .edit-section h3 { 
+        font-size: 1rem; 
+        margin-bottom: 1rem; 
+        color: var(--text-main); 
+        border-left: 3px solid var(--primary); 
+        padding-left: 0.75rem;
+    }
+    .stats-info { 
+        display: flex; 
+        gap: 1.5rem; 
+        align-items: center; 
+        font-size: 0.875rem; 
+        color: var(--text-sub);
+        flex-wrap: wrap;
+    }
+    .stats-info span { 
+        display: flex; 
+        align-items: center; 
+        gap: 0.5rem;
+        padding: 0.25rem 0.5rem;
+        background: #f1f5f9;
+        border-radius: 0.375rem;
+    }
+    .editable-ip-list { 
+        max-height: 300px; 
+        overflow-y: auto; 
+        border: 1px solid var(--border); 
+        border-radius: 0.5rem; 
+        padding: 0.5rem; 
+        margin-bottom: 1rem;
+        background: #f8fafc;
+    }
+    .editable-ip-item { 
+        display: flex; 
+        justify-content: space-between; 
+        align-items: center; 
+        padding: 0.75rem; 
+        margin-bottom: 0.5rem; 
+        background: white; 
+        border-radius: 0.5rem;
+        border: 1px solid var(--border);
+        transition: all 0.2s;
+    }
+    .editable-ip-item:hover {
+        background: var(--primary-light);
+        transform: translateX(4px);
+    }
+    .editable-ip-text { 
+        font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+        font-size: 0.875rem; 
+        flex: 1; 
+        margin-right: 0.75rem; 
+    }
+    .editable-ip-actions { 
+        display: flex; 
+        gap: 0.5rem; 
+    }
+    .btn-small { 
+        padding: 0.375rem 0.75rem; 
+        font-size: 0.75rem; 
+    }
+    .ip-add-form { 
+        display: flex; 
+        flex-direction: column; 
+        gap: 0.75rem; 
+        margin-bottom: 1rem; 
+    }
+    .ip-add-actions { 
+        display: flex; 
+        gap: 0.75rem; 
+        margin-top: 0.75rem; 
+    }
+    .control-buttons {
+        display: flex;
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+        align-items: center;
+        flex-wrap: wrap;
+    }
+    .checkbox-control {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-left: auto;
+    }
+    @media (max-width: 800px) { 
+        .tools-layout { 
+            grid-template-columns: 1fr; 
+        } 
+    }
+    @media (max-width: 640px) { 
+        .container { 
+            padding: 0 0.5rem; 
+        } 
+        .tab { 
+            padding: 0.5rem 1rem; 
+            font-size: 0.875rem; 
+        } 
+        .tab-content { 
+            padding: 1.5rem 1rem; 
+        } 
+        .item { 
+            flex-direction: column; 
+            align-items: flex-start; 
+            gap: 1rem; 
+        } 
+        .item button { 
+            width: 100%; 
+        }
+        .checkbox-group {
+            grid-template-columns: 1fr;
+        }
+        .control-buttons {
+            flex-direction: column;
+            align-items: stretch;
+        }
+        .checkbox-control {
+            margin-left: 0;
+            margin-top: 0.75rem;
+        }
+    }
 </style>
 </head>
 <body>
 <div class="container">
     <header>
-        <h1>⚡️ 优选IP系统 v10.7</h1>
-        <a href="/api/logout" class="logout"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg> 退出</a>
+        <h1>⚡️ 节点管理控制台 v10.8</h1>
+        <a href="/api/logout" class="logout">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
+            </svg> 
+            退出登录
+        </a>
     </header>
     <div id="message" class="message"></div>
 
@@ -1045,136 +1534,153 @@ function getAdminPage(base64Data, origin) {
         </nav>
         
         <div id="upload-sub-tab" class="sub-tab-content active">
-            <h2>上传本地 IP 文件 (CSV/TXT)</h2>
+            <h2>📂 上传本地 IP 文件 (CSV/TXT)</h2>
             <div class="upload-area" id="upload-box">
-                <svg width="32" height="32" fill="none" stroke="#9ca3af" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
-                <p style="margin-top:8px;font-size:0.9rem">点击或拖拽文件到此处<br><span style="font-size:0.8rem;color:#9ca3af">(支持 TG 机器人转发上传)</span></p>
+                <svg width="48" height="48" fill="none" stroke="#94a3b8" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                </svg>
+                <p style="margin-top: 1rem; font-size: 1.125rem; font-weight: 600;">点击或拖拽文件到此处</p>
+                <p style="margin-top: 0.5rem; font-size: 0.875rem; color: var(--text-sub);">也支持直接发文件给 TG 机器人</p>
                 <input type="file" id="file-input" style="display:none">
+            </div>
+            <div style="background: var(--primary-light); padding: 1rem; border-radius: 0.75rem; margin: 1.5rem 0; font-size: 0.875rem; color: var(--primary); border-left: 4px solid var(--primary);">
+                <strong>💡 提示：</strong> 上传后系统会自动去重和标准化。如果配置了 TG 机器人，可以直接转发 CSV 文件给机器人自动上传。
             </div>
             <div class="item-list" id="uploaded-list"></div>
         </div>
 
         <div id="urls-sub-tab" class="sub-tab-content">
-            <h2>订阅链接</h2>
-            <div class="form-group" style="display:flex; gap:8px">
-                <input type="text" id="new-url-name" placeholder="名称" style="flex:1">
-                <input type="text" id="new-url-link" placeholder="订阅链接 (必填)" style="flex:2.5">
+            <h2>📡 订阅链接管理</h2>
+            <div class="form-group" style="display:flex; gap:0.75rem">
+                <input type="text" id="new-url-name" placeholder="名称 (选填)" style="flex:1">
+                <input type="text" id="new-url-link" placeholder="订阅链接 (必填)" style="flex:2">
             </div>
-            <button id="btn-add-url" class="btn-success" style="width:100%">+ 添加订阅链接</button>
+            <button id="btn-add-url" class="btn-success">➕ 添加订阅链接</button>
             <div class="item-list" id="url-list"></div>
         </div>
 
         <div id="apis-sub-tab" class="sub-tab-content">
-            <h2>API 接口</h2>
-            <div class="form-group" style="display:flex; gap:8px">
-                <input type="text" id="new-api-name" placeholder="名称" style="flex:1">
-                <input type="text" id="new-api-link" placeholder="API 链接 (必填)" style="flex:2.5">
+            <h2>🔗 API 接口管理</h2>
+            <div class="form-group" style="display:flex; gap:0.75rem">
+                <input type="text" id="new-api-name" placeholder="名称 (选填)" style="flex:1">
+                <input type="text" id="new-api-link" placeholder="API 链接 (必填)" style="flex:2">
             </div>
-            <button id="btn-add-api" class="btn-success" style="width:100%">+ 添加 API</button>
+            <button id="btn-add-api" class="btn-success">➕ 添加 API</button>
             <div class="item-list" id="api-list"></div>
         </div>
 
         <div id="custom-sub-tab" class="sub-tab-content">
-            <h2>自定义 IP 池</h2>
-            <div style="margin-bottom:8px; color:var(--text-sub); font-size:0.85rem">当前数量: <strong id="ip-count" style="color:var(--primary)">0</strong></div>
-            <div class="form-group"><textarea id="custom-ips" rows="10" placeholder="1.1.1.1:443#备注"></textarea></div>
-            <div style="display:flex; gap:10px">
-                <button id="btn-save-custom" class="btn-success" style="flex:1">💾 保存配置</button>
-                <button id="btn-clear-custom" class="btn-danger">🗑️ 清空</button>
+            <h2>📝 自定义 IP 池</h2>
+            <div style="margin-bottom:1rem; color:var(--text-sub); font-size: 0.875rem;">
+                当前数量: <strong id="ip-count" style="color:var(--primary); font-size: 1.125rem;">0</strong> 个 IP
+            </div>
+            <div class="form-group">
+                <textarea id="custom-ips" rows="12" placeholder="每行一个IP，格式: 1.1.1.1:443#备注&#10;或: 1.1.1.1&#10;或: 1.1.1.1:8080"></textarea>
+            </div>
+            <div style="display:flex; gap:0.75rem">
+                <button id="btn-save-custom" class="btn-success">💾 保存更改</button>
+                <button id="btn-clear-custom" class="btn-danger">🗑️ 清空全部</button>
             </div>
         </div>
 
         <div id="sites-ip-sub-tab" class="sub-tab-content">
-            <h2>IP 资源网站收藏</h2>
-            <div style="display:flex; gap:8px; margin-bottom:15px">
+            <h2>🌐 IP 资源网站收藏</h2>
+            <div style="display:flex; gap:0.75rem; margin-bottom:1.5rem">
                 <input type="text" id="site-name-ip" placeholder="网站名称" style="flex:1">
-                <input type="text" id="site-url-ip" placeholder="网址" style="flex:2">
-                <button id="btn-add-site-ip" class="btn-success">添加</button>
+                <input type="text" id="site-url-ip" placeholder="网址 (http://...)" style="flex:2">
+                <button id="btn-add-site-ip" class="btn-success">➕ 添加</button>
             </div>
             <div class="item-list" id="site-list-ip"></div>
         </div>
     </div>
 
     <div id="extract-tab" class="tab-content">
-        <h2>提取预览</h2>
-        <div class="tool-bar">
-            <button id="ext-select-all" class="btn-primary btn-sm">全选</button>
-            <button id="ext-deselect-all" class="btn-secondary btn-sm">反选</button>
-            <div class="vt-divider"></div>
-            <label class="tool-check" title="包含手动填写的自定义IP池">
-                <input type="checkbox" id="ext-custom" checked> 自定义 IP
-            </label>
+        <h2>🧪 IP 提取预览</h2>
+        <div class="control-buttons">
+            <button id="ext-select-all" class="btn-primary">✅ 全选</button>
+            <button id="ext-deselect-all" class="btn-danger">❌ 反选</button>
+            <div class="checkbox-control">
+                <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;font-weight: 500;">
+                    <input type="checkbox" id="ext-custom" checked style="width:1.25rem;height:1.25rem;"> 
+                    包含自定义 IP 池
+                </label>
+            </div>
         </div>
-        
         <div id="ext-sources" class="checkbox-group"></div>
-        
-        <div style="display:flex; gap:10px; margin-top:1.5rem">
-            <button id="btn-extract" class="btn-primary" style="flex:1">🚀 立即提取</button>
+        <div style="display:flex; gap:0.75rem; margin-top:1.5rem;">
+            <button id="btn-extract" class="btn-primary" style="flex:1;">🚀 立即提取</button>
             <button id="btn-copy-extract" class="btn-success" style="display:none;">📋 复制结果</button>
         </div>
-        <pre id="extract-result" style="color:#9ca3af">等待提取...</pre>
+        <pre id="extract-result">准备就绪...</pre>
     </div>
 
     <div id="files-tab" class="tab-content">
-        <h2>生成订阅文件</h2>
-        <div class="form-group" style="display:flex; gap:10px; align-items:center">
-            <label style="white-space:nowrap;font-weight:600">文件名:</label>
-            <input type="text" id="file-name" placeholder="例如: best_cf (不用带后缀)">
+        <h2>📂 生成订阅文件</h2>
+        <div class="form-group">
+            <label style="display:block; margin-bottom: 0.5rem; font-weight: 600;">文件名</label>
+            <input type="text" id="file-name" placeholder="例如: best_cf" style="font-size: 1rem;">
         </div>
-
-        <div class="tool-bar">
-            <button id="file-select-all" class="btn-primary btn-sm">全选</button>
-            <button id="file-deselect-all" class="btn-secondary btn-sm">反选</button>
-            <div class="vt-divider"></div>
-            <label class="tool-check">
-                <input type="checkbox" id="file-custom" checked> 自定义IP
-            </label>
-            <label class="tool-check">
-                <input type="checkbox" id="file-auto" checked> 自动更新
-            </label>
+        <div class="control-buttons">
+            <button id="file-select-all" class="btn-primary">✅ 全选</button>
+            <button id="file-deselect-all" class="btn-danger">❌ 反选</button>
+            <div class="checkbox-control">
+                <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;font-weight: 500;">
+                    <input type="checkbox" id="file-custom" checked style="width:1.25rem;height:1.25rem;"> 
+                    包含自定义IP
+                </label>
+                <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;font-weight: 500;">
+                    <input type="checkbox" id="file-auto" checked style="width:1.25rem;height:1.25rem;"> 
+                    自动更新
+                </label>
+            </div>
         </div>
-
         <div id="file-sources" class="checkbox-group"></div>
-        <button id="btn-save-file" class="btn-success" style="margin-top:1.5rem; width:100%">💾 生成并保存文件</button>
-        
-        <h3 style="margin-top:2rem;font-size:1rem;padding-left:8px;border-left:3px solid var(--warning)">已生成的文件</h3>
+        <button id="btn-save-file" class="btn-success" style="margin-top:1.5rem; width:100%">💾 生成文件</button>
+        <h3 style="margin-top:2.5rem;font-size:1.25rem;padding-left:1rem;border-left:4px solid var(--warning); display: flex; align-items: center; gap: 0.5rem;">📋 已生成文件</h3>
         <div class="item-list" id="file-list"></div>
     </div>
 
     <div id="editable-tab" class="tab-content">
-        <h2>可编辑文件管理</h2>
-        <div style="background:#f0f9ff; padding:10px; border-radius:5px; margin-bottom:15px; font-size:0.85rem; color:#0369a1; border-left:4px solid #38bdf8;"><strong>提示：</strong> 此处创建的文件可作为数据源用于生成最终订阅。</div>
+        <h2>✏️ 可编辑文件管理</h2>
+        <div style="background: #f0f9ff; padding: 1rem; border-radius: 0.75rem; margin-bottom: 1.5rem; font-size: 0.875rem; color: #0369a1; border-left: 4px solid #38bdf8;">
+            <strong>💡 提示：</strong> 可编辑文件现已作为"内部模块"使用。您可以在"生成订阅文件"中勾选它们作为数据源，组合成最终的订阅链接。
+        </div>
         <div class="item-list" id="editable-list"></div>
-        <div style="margin-top:1.5rem; text-align:center;">
+        <div style="margin-top:2rem; text-align:center;">
             <button id="btn-create-editable" class="btn-primary">➕ 创建新的可编辑文件</button>
         </div>
     </div>
 
     <div id="tools-tab" class="tab-content">
-        <h2>IP 智能查询工具</h2>
+        <h2>🛠️ IP 智能查询工具</h2>
         <div class="tools-layout">
             <div>
-                <div style="background:#fff3cd; color:#856404; padding:8px; border-radius:5px; margin-bottom:10px; font-size:0.8rem; border-left:4px solid #ffeeba;">此处查询会忽略备注，强制刷新 API 获取国家信息。</div>
-                <div class="form-group" style="margin-bottom:8px">
-                    <label class="tool-check">
-                        <input type="checkbox" id="tool-deduplicate" checked> 启用去重
+                <div style="background: var(--warning-light); color: #92400e; padding: 1rem; border-radius: 0.75rem; margin-bottom: 1rem; font-size: 0.875rem; border-left: 4px solid var(--warning);">
+                    <strong>⚠️ 注意：</strong> 此处查询会忽略已有备注，强制刷新 API 获取最新国家信息。
+                </div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:0.75rem;cursor:pointer;font-weight: 500;">
+                        <input type="checkbox" id="tool-deduplicate" checked style="width:1.25rem;height:1.25rem;"> 
+                        启用去重功能
                     </label>
                 </div>
-                <div class="form-group"><textarea id="tool-input" rows="10" placeholder="粘贴 IP 列表..."></textarea></div>
-                <div style="display:flex; gap:10px">
-                    <button id="btn-tool-run" class="btn-primary" style="flex:1">🚀 查询</button>
-                    <button id="btn-tool-copy" class="btn-success" style="display:none">📋 复制</button>
-                    <button id="btn-tool-save" class="btn-warning" style="display:none">💾 存为文件</button>
+                <div class="form-group">
+                    <textarea id="tool-input" rows="12" placeholder="粘贴 IP 列表...&#10;每行一个IP，支持端口和备注"></textarea>
+                </div>
+                <div style="display:flex; gap:0.75rem; flex-wrap: wrap;">
+                    <button id="btn-tool-run" class="btn-primary">🚀 开始查询</button>
+                    <button id="btn-tool-copy" class="btn-success" style="display:none;">📋 复制结果</button>
+                    <button id="btn-tool-save" class="btn-warning" style="display:none;">💾 保存为可编辑文件</button>
                 </div>
                 <pre id="tool-output" style="display:none;"></pre>
             </div>
             <div class="tools-sidebar">
-            <h3 style="font-size:0.95rem; margin-bottom:0.8rem; border-left:3px solid var(--primary); padding-left:8px;">🔗 友情链接 / 工具</h3>
+            <h3 style="font-size:1.125rem; margin-bottom:1.25rem; border-left:3px solid var(--primary); padding-left:0.75rem; display: flex; align-items: center; gap: 0.5rem;">🔗 友情链接 / 工具</h3>
             <div id="friend-links-list"></div>
-            <div style="margin-top:15px; border-top:1px solid #e5e7eb; padding-top:10px;">
-                 <input type="text" id="site-name-friend" placeholder="名称" style="width:100%;margin-bottom:5px;padding:5px;">
-                 <input type="text" id="site-url-friend" placeholder="链接" style="width:100%;margin-bottom:5px;padding:5px;">
-                 <button id="btn-add-site-friend" class="btn-secondary" style="width:100%;font-size:0.8rem;">+ 添加链接</button>
+            <div style="margin-top:1.5rem; border-top:1px solid var(--border); padding-top:1rem;">
+                 <input type="text" id="site-name-friend" placeholder="名称" style="width:100%;margin-bottom:0.75rem;padding:0.75rem;">
+                 <input type="text" id="site-url-friend" placeholder="链接" style="width:100%;margin-bottom:0.75rem;padding:0.75rem;">
+                 <button id="btn-add-site-friend" class="btn-secondary" style="width:100%;font-size:0.875rem;">➕ 添加链接</button>
             </div>
         </div>
     </div>
@@ -1184,31 +1690,32 @@ function getAdminPage(base64Data, origin) {
 <div id="edit-file-modal" class="modal">
 <div class="modal-content">
     <div class="modal-header">
-        <h3 class="modal-title">编辑可编辑文件</h3>
+        <h3 class="modal-title">✏️ 编辑可编辑文件</h3>
         <span class="close">&times;</span>
     </div>
     <div class="modal-body">
         <div class="edit-section">
-            <h3>文件名: <span id="edit-file-name" style="color: var(--primary);"></span></h3>
+            <h3>📁 文件名: <span id="edit-file-name" style="color: var(--primary);"></span></h3>
         </div>
         
         <div class="edit-section">
+            <h3>📝 批量编辑 / 添加 IP</h3>
             <div class="ip-add-form">
-                <textarea id="batch-ip-input" rows="5" placeholder="在此处粘贴 IP 列表 (格式: IP:端口#备注)"></textarea>
+                <textarea id="batch-ip-input" rows="6" placeholder="在此处粘贴 IP 列表 (每行一个，格式: IP:端口#备注)"></textarea>
                 <div class="ip-add-actions">
-                    <button id="btn-batch-add" class="btn-success btn-sm" style="flex:1">➕ 追加</button>
-                    <button id="btn-batch-replace" class="btn-warning btn-sm" style="flex:1">🔄 覆盖</button>
-                    <button id="btn-clear-all" class="btn-danger btn-sm" style="flex:1">🗑️ 清空</button>
+                    <button id="btn-batch-add" class="btn-success btn-small" style="flex:1">➕ 批量追加</button>
+                    <button id="btn-batch-replace" class="btn-warning btn-small" style="flex:1">🔄 覆盖导入</button>
+                    <button id="btn-clear-all" class="btn-danger btn-small" style="flex:1">🗑️ 一键清空</button>
                 </div>
             </div>
-            <div style="display:flex;justify-content:space-between;margin:10px 0 5px 0;align-items:center;">
-                <h4 style="margin:0;font-size:0.9rem;">当前列表 (<span id="current-ip-count">0</span>)</h4>
-                <button id="btn-copy-list" class="btn-secondary btn-sm">📋 复制</button>
+            <div style="display:flex;justify-content:space-between;margin-bottom:0.75rem; align-items: center;">
+                <h4 style="margin:0;font-size:1rem; font-weight: 600;">📋 当前列表 (<span id="current-ip-count">0</span>)</h4>
+                <button id="btn-copy-list" class="btn-secondary btn-small">📋 复制列表</button>
             </div>
             <div class="editable-ip-list" id="editable-ip-list"></div>
         </div>
     </div>
-    <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:10px;">
+    <div class="modal-footer">
         <button id="btn-cancel-edit" class="btn-secondary">取消</button>
         <button id="btn-save-edit" class="btn-primary">保存更改</button>
     </div>
@@ -1218,37 +1725,38 @@ function getAdminPage(base64Data, origin) {
 <div id="edit-sources-modal" class="modal">
 <div class="modal-content">
     <div class="modal-header">
-        <h3 class="modal-title">编辑文件数据源</h3>
+        <h3 class="modal-title">⚙️ 编辑文件数据源</h3>
         <span class="close">&times;</span>
     </div>
     <div class="modal-body">
         <div class="edit-section">
-            <h3>文件名: <span id="edit-file-name" style="color: var(--primary);"></span></h3>
+            <h3>📁 文件名: <span id="edit-file-name" style="color: var(--primary);"></span></h3>
         </div>
         
         <div class="edit-section">
-            <h3>配置选项</h3>
-            <div style="display:flex; gap:15px; background:#f9fafb; padding:10px; border-radius:6px; border:1px solid var(--border)">
-                <label class="tool-check">
-                    <input type="checkbox" id="edit-auto-update"> 启用自动更新
-                </label>
-                <label class="tool-check">
-                    <input type="checkbox" id="edit-custom"> 包含自定义IP池
-                </label>
-            </div>
+            <h3>🔄 自动更新</h3>
+            <label style="display:flex;align-items:center;gap:0.75rem;cursor:pointer;font-weight: 500;">
+                <input type="checkbox" id="edit-auto-update" style="width:1.25rem;height:1.25rem;"> 启用自动更新
+            </label>
         </div>
         
         <div class="edit-section">
-            <div class="tool-bar" style="margin-top:10px">
-                 <button id="edit-select-all" class="btn-primary btn-sm">全选</button>
-                 <button id="edit-deselect-all" class="btn-secondary btn-sm">反选</button>
-                 <div class="vt-divider"></div>
-                 <span style="font-size:0.8rem;color:#666">请勾选数据源</span>
+            <h3>📊 数据源配置</h3>
+            <div style="display:flex; gap:0.75rem; margin-bottom:1rem;">
+                <button id="edit-select-all" class="btn-primary">✅ 全选</button>
+                <button id="edit-deselect-all" class="btn-danger">❌ 反选</button>
             </div>
             <div id="edit-sources" class="checkbox-group"></div>
         </div>
+        
+        <div class="edit-section">
+            <h3>📝 自定义IP</h3>
+            <label style="display:flex;align-items:center;gap:0.75rem;cursor:pointer;font-weight: 500;">
+                <input type="checkbox" id="edit-custom" style="width:1.25rem;height:1.25rem;"> 包含自定义IP池
+            </label>
+        </div>
     </div>
-    <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:10px;">
+    <div class="modal-footer">
         <button id="btn-cancel-edit" class="btn-secondary">取消</button>
         <button id="btn-save-edit-sources" class="btn-primary">保存并重新生成</button>
     </div>
@@ -1280,7 +1788,7 @@ function formatBeijingTime(isoString) {
 function getRecipeHtml(sources) {
     if(!sources) return '';
     let html = '';
-    if(sources.includeCustom) html += '<span class="src-badge custom">📝 自定义</span>';
+    if(sources.includeCustom) html += '<span class="src-badge custom">📝 自定义IP</span>';
     if(sources.files && sources.files.length) sources.files.forEach(f => {
         if(appData.uploadedFiles.includes(f)) html += '<span class="src-badge file">📄 ' + escapeHtml(f) + '</span>';
         else html += '<span class="src-badge editable">✏️ ' + escapeHtml(f) + '</span>';
@@ -1305,14 +1813,14 @@ function getRecipeHtml(sources) {
 function render() {
     const renderSourceList = (id, list, type) => {
         document.getElementById(id).innerHTML = list.map((item, i) => 
-            '<div class="item"><div class="item-content"><div style="font-weight:600;color:var(--text-main)">' + (item.name ? escapeHtml(item.name) : '<span style="color:#9ca3af;font-style:italic">未命名</span>') + '</div><div style="font-size:0.75rem;color:#6b7280;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(item.url) + '</div></div><button class="btn-danger btn-sm" data-action="delete" data-type="' + type + '" data-val="' + i + '">删除</button></div>'
+            '<div class="item"><div class="item-content"><div style="font-weight:700;color:var(--text-main); font-size: 1rem;">' + (item.name ? escapeHtml(item.name) : '<span style="color:#94a3b8;font-style:italic">未命名</span>') + '</div><div style="font-size:0.875rem;color:var(--text-sub);margin-top:0.25rem;word-break:break-all">' + escapeHtml(item.url) + '</div></div><button class="btn-danger" data-action="delete" data-type="' + type + '" data-val="' + i + '" style="padding:0.5rem 1rem;font-size:0.875rem;">🗑️ 删除</button></div>'
         ).join('');
     };
     renderSourceList('url-list', appData.urls, 'urls');
     renderSourceList('api-list', appData.apis, 'apis');
     
     document.getElementById('uploaded-list').innerHTML = appData.uploadedFiles.map(t => 
-        '<div class="item"><div class="item-content">📄 <strong>' + escapeHtml(t) + '</strong></div><div style="display:flex; gap:5px;"><button class="btn-secondary btn-sm preview-btn" data-filename="' + escapeHtml(t) + '">预览</button><button class="btn-danger btn-sm" data-action="delete-file" data-val="' + escapeHtml(t) + '">删除</button></div></div>'
+        '<div class="item"><div class="item-content">📄 <strong style="font-size: 1rem;">' + escapeHtml(t) + '</strong></div><div style="display:flex; gap:0.75rem;"><button class="btn-secondary preview-btn" data-filename="' + escapeHtml(t) + '" style="padding:0.5rem 1rem;font-size:0.875rem;">👁️ 预览</button><button class="btn-danger" data-action="delete-file" data-val="' + escapeHtml(t) + '" style="padding:0.5rem 1rem;font-size:0.875rem;">🗑️ 删除</button></div></div>'
     ).join('');
 
     document.getElementById('custom-ips').value = appData.customIPs.join('\\n');
@@ -1322,9 +1830,9 @@ function render() {
     const friendSitesHtml = [];
     (appData.sitesList || []).forEach((s, realIdx) => {
         if(s.type === 'ip') {
-           ipSitesHtml.push('<div class="item"><div class="item-content"><a href="' + escapeHtml(s.url) + '" target="_blank" style="font-weight:600;color:var(--primary);text-decoration:none">🔗 ' + escapeHtml(s.name) + '</a><div style="color:#666;font-size:0.75rem">' + escapeHtml(s.url) + '</div></div><button class="btn-danger btn-sm" data-action="del-site" data-val="' + realIdx + '">删除</button></div>');
+           ipSitesHtml.push('<div class="item"><div class="item-content"><a href="' + escapeHtml(s.url) + '" target="_blank" style="font-weight:700;color:var(--primary);text-decoration:none;font-size: 1rem;">🔗 ' + escapeHtml(s.name) + '</a><div style="color:var(--text-sub);font-size:0.875rem;margin-top:0.25rem">' + escapeHtml(s.url) + '</div></div><button class="btn-danger" data-action="del-site" data-val="' + realIdx + '" style="padding:0.5rem 1rem;font-size:0.875rem;">🗑️ 删除</button></div>');
         } else if(s.type === 'friend') {
-           friendSitesHtml.push('<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;"><a href="' + escapeHtml(s.url) + '" target="_blank" class="link-card" style="flex:1;margin-bottom:0">👉 ' + escapeHtml(s.name) + '</a><span data-action="del-site" data-val="' + realIdx + '" style="cursor:pointer;color:#999;font-size:0.8rem;padding:0 5px;">✕</span></div>');
+           friendSitesHtml.push('<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem;"><a href="' + escapeHtml(s.url) + '" target="_blank" class="link-card" style="flex:1;margin-bottom:0">👉 ' + escapeHtml(s.name) + '</a><span data-action="del-site" data-val="' + realIdx + '" style="cursor:pointer;color:var(--text-sub);font-size:0.875rem;padding:0.25rem 0.5rem; border-radius: 0.25rem; transition: all 0.2s;">✕</span></div>');
         }
     });
     document.getElementById('site-list-ip').innerHTML = ipSitesHtml.join('');
@@ -1333,28 +1841,28 @@ function render() {
     const renderChecks = (prefix) => {
         let html = '';
         if(appData.uploadedFiles.length) {
-            html += '<div style="grid-column:1/-1;font-weight:600;color:var(--primary);margin-top:2px;font-size:0.85rem">📂 上传的文件</div>';
+            html += '<div style="grid-column:1/-1;font-weight:700;color:var(--primary);margin-top:0.5rem;margin-bottom:0.75rem;padding-bottom:0.5rem;border-bottom:1px solid var(--border); display: flex; align-items: center; gap: 0.5rem;">📂 上传的文件</div>';
             appData.uploadedFiles.forEach(f => { html += '<label><input type="checkbox" value="' + escapeHtml(f) + '" class="' + prefix + '-file-cb"> ' + escapeHtml(f) + '</label>'; });
         }
         if(appData.editableFiles.length) {
-            html += '<div style="grid-column:1/-1;font-weight:600;color:#7c3aed;margin-top:2px;font-size:0.85rem">✏️ 可编辑文件</div>';
+            html += '<div style="grid-column:1/-1;font-weight:700;color:#7c3aed;margin-top:0.5rem;margin-bottom:0.75rem;padding-bottom:0.5rem;border-bottom:1px solid var(--border); display: flex; align-items: center; gap: 0.5rem;">✏️ 可编辑文件</div>';
             appData.editableFiles.forEach(f => { html += '<label><input type="checkbox" value="' + escapeHtml(f.name) + '" class="' + prefix + '-file-cb"> ' + escapeHtml(f.name) + '</label>'; });
         }
         if(appData.urls.length) {
-            html += '<div style="grid-column:1/-1;font-weight:600;color:var(--primary);margin-top:5px;font-size:0.85rem">📡 订阅链接</div>';
+            html += '<div style="grid-column:1/-1;font-weight:700;color:var(--primary);margin-top:1rem;margin-bottom:0.75rem;padding-bottom:0.5rem;border-bottom:1px solid var(--border); display: flex; align-items: center; gap: 0.5rem;">📡 订阅链接</div>';
             appData.urls.forEach((item,i) => { 
                 const name = item.name || ('订阅 #' + (i+1));
                 html += '<label><input type="checkbox" value="' + i + '" class="' + prefix + '-url-cb"> ' + escapeHtml(name) + '</label>'; 
             });
         }
         if(appData.apis.length) {
-            html += '<div style="grid-column:1/-1;font-weight:600;color:var(--primary);margin-top:5px;font-size:0.85rem">🔗 API</div>';
+            html += '<div style="grid-column:1/-1;font-weight:700;color:var(--primary);margin-top:1rem;margin-bottom:0.75rem;padding-bottom:0.5rem;border-bottom:1px solid var(--border); display: flex; align-items: center; gap: 0.5rem;">🔗 API</div>';
             appData.apis.forEach((item,i) => { 
                 const name = item.name || ('API #' + (i+1));
                 html += '<label><input type="checkbox" value="' + i + '" class="' + prefix + '-api-cb"> ' + escapeHtml(name) + '</label>'; 
             });
         }
-        return html || '<div style="grid-column:1/-1;color:#888;padding:10px;text-align:center">⚠️ 暂无数据源</div>';
+        return html || '<div style="color:var(--text-sub);padding:1rem;text-align:center;">⚠️ 暂无数据源</div>';
     };
     document.getElementById('ext-sources').innerHTML = renderChecks('ext');
     document.getElementById('file-sources').innerHTML = renderChecks('file');
@@ -1362,12 +1870,14 @@ function render() {
     document.getElementById('file-list').innerHTML = appData.ipFiles.map(f => {
         const stats = f.stats || { total: 0, today: 0, lastAccess: null };
         const lastAccessStr = stats.lastAccess ? formatBeijingTime(stats.lastAccess) : '--';
-        return '<div class="item"><div class="item-content" style="display:flex;flex-direction:column;gap:4px"><div style="font-weight:700;color:var(--primary)">' + escapeHtml(f.name) + ' ' + (f.autoUpdate?'<span class="badge auto">🔄 自动</span>':'<span class="badge">⚪️ 手动</span>') + '</div><div style="margin-top:2px;display:flex;flex-wrap:wrap;gap:2px">' + getRecipeHtml(f.sources) + '</div><div class="stats-info"><span>🔥 ' + (stats.total||0) + '</span><span>🕒 ' + lastAccessStr + '</span></div><div style="display:flex;gap:10px;margin-top:5px"><a href="' + currentOrigin + '/ip/' + f.name + '" target="_blank" style="color:var(--primary);text-decoration:none;font-weight:600;font-size:0.85rem">🔗 Link</a><a href="' + currentOrigin + '/r2/' + f.name + '" target="_blank" style="color:#10b981;text-decoration:none;font-weight:600;font-size:0.85rem">🚀 R2</a></div></div><div style="display:flex;flex-direction:column;gap:5px"><button class="btn-warning btn-sm" data-action="update-file" data-val="' + escapeHtml(f.name) + '" title="立即更新">⚡️</button><button class="btn-secondary btn-sm" data-action="edit-sources" data-val="' + escapeHtml(f.name) + '" title="编辑源">✏️</button><button class="btn-secondary btn-sm" data-action="reset-stats" data-val="' + escapeHtml(f.name) + '" title="重置统计">🔄</button><button class="btn-danger btn-sm" data-action="delete-file-gen" data-val="' + escapeHtml(f.name) + '" title="删除">🗑️</button></div></div>';
+        return '<div class="item"><div class="item-content" style="display:flex;flex-direction:column;gap:0.75rem"><div style="font-weight:700;color:var(--primary); font-size: 1.125rem;">' + escapeHtml(f.name) + ' ' + (f.autoUpdate?'<span class="badge auto">🔄 自动更新</span>':'<span class="badge">⚪️ 手动更新</span>') + '</div><div style="margin-top:0.25rem;display:flex;flex-wrap:wrap;gap:0.5rem">' + getRecipeHtml(f.sources) + '</div><div class="stats-info"><span>🔥 总访问: ' + (stats.total||0) + '</span><span>📅 今日: ' + (stats.today||0) + '</span><span>🕒 最后: ' + lastAccessStr + '</span></div><div style="display:flex;gap:0.75rem;margin-top:0.75rem"><a href="' + currentOrigin + '/ip/' + f.name + '" target="_blank" style="color:var(--primary);text-decoration:none;font-weight:600;padding:0.375rem 0.75rem;background: var(--primary-light); border-radius: 0.375rem; font-size: 0.875rem;">🔗 Workers链接</a><a href="' + currentOrigin + '/r2/' + f.name + '" target="_blank" style="color:var(--success);text-decoration:none;font-weight:600;padding:0.375rem 0.75rem;background: var(--success-light); border-radius: 0.375rem; font-size: 0.875rem;">🚀 R2直链</a></div></div><div style="display:flex;flex-direction:column;gap:0.5rem"><button class="btn-warning" data-action="update-file" data-val="' + escapeHtml(f.name) + '" style="padding:0.5rem 1rem;font-size:0.875rem;">⚡️ 立即更新</button><button class="btn-secondary" data-action="edit-sources" data-val="' + escapeHtml(f.name) + '" style="padding:0.5rem 1rem;font-size:0.875rem;">✏️ 编辑源</button><button class="btn-secondary" data-action="reset-stats" data-val="' + escapeHtml(f.name) + '" style="padding:0.5rem 1rem;font-size:0.875rem;">🔄 重置统计</button><button class="btn-danger" data-action="delete-file-gen" data-val="' + escapeHtml(f.name) + '" style="padding:0.5rem 1rem;font-size:0.875rem;">🗑️ 删除</button></div></div>';
     }).join('');
 
     document.getElementById('editable-list').innerHTML = (appData.editableFiles || []).map(f => {
+        const stats = f.stats || { total: 0, today: 0, lastAccess: null };
+        const lastAccessStr = stats.lastAccess ? formatBeijingTime(stats.lastAccess) : '--';
         const ipCount = f.ips ? f.ips.length : 0;
-        return '<div class="item"><div class="item-content" style="display:flex;flex-direction:column;gap:4px"><div style="font-weight:700;color:#7c3aed">' + escapeHtml(f.name) + ' <span class="badge editable">✏️ 可编辑</span></div><div class="stats-info"><span>📊 ' + ipCount + ' 个IP</span><span>📅 ' + formatBeijingTime(f.lastUpdate) + '</span></div></div><div style="display:flex;flex-direction:column;gap:5px"><button class="btn-primary btn-sm" data-action="edit-file" data-val="' + escapeHtml(f.name) + '">✏️ 编辑</button><button class="btn-danger btn-sm" data-action="delete-editable" data-val="' + escapeHtml(f.name) + '">🗑️</button></div></div>';
+        return '<div class="item"><div class="item-content" style="display:flex;flex-direction:column;gap:0.75rem"><div style="font-weight:700;color:#7c3aed; font-size: 1.125rem;">' + escapeHtml(f.name) + ' <span class="badge editable">✏️ 可编辑</span></div><div class="stats-info"><span>📊 IP数量: ' + ipCount + '</span><span>📅 更新: ' + formatBeijingTime(f.lastUpdate) + '</span><span>🔥 访问: ' + (stats.total||0) + '</span></div></div><div style="display:flex;flex-direction:column;gap:0.5rem"><button class="btn-primary" data-action="edit-file" data-val="' + escapeHtml(f.name) + '" style="padding:0.5rem 1rem;font-size:0.875rem;">✏️ 编辑</button><button class="btn-danger" data-action="delete-editable" data-val="' + escapeHtml(f.name) + '" style="padding:0.5rem 1rem;font-size:0.875rem;">🗑️ 删除</button></div></div>';
     }).join('');
 }
 
@@ -1397,15 +1907,13 @@ document.addEventListener('click', async e => {
             const res = await apiCall('/api/extract', 'POST', { sources: { files: [fileName], urls: [], apis: [], includeCustom: false } });
             alert('文件 "' + fileName + '" 可提取 ' + res.count + ' 个IP:\\n\\n' + res.ips.slice(0, 5).join('\\n') + (res.count > 5 ? '\\n...' : ''));
         } catch(e) { showMsg(e.message, 'error'); }
-        t.disabled = false; t.innerText = '预览';
+        t.disabled = false; t.innerText = '👁️ 预览';
     }
 
     if(t.id === 'ext-select-all') { document.querySelectorAll('#ext-sources input[type="checkbox"]').forEach(cb => cb.checked = true); }
     if(t.id === 'ext-deselect-all') { document.querySelectorAll('#ext-sources input[type="checkbox"]').forEach(cb => cb.checked = false); }
     if(t.id === 'file-select-all') { document.querySelectorAll('#file-sources input[type="checkbox"]').forEach(cb => cb.checked = true); }
     if(t.id === 'file-deselect-all') { document.querySelectorAll('#file-sources input[type="checkbox"]').forEach(cb => cb.checked = false); }
-    if(t.id === 'edit-select-all') { document.querySelectorAll('#edit-sources input[type="checkbox"]').forEach(cb => cb.checked = true); }
-    if(t.id === 'edit-deselect-all') { document.querySelectorAll('#edit-sources input[type="checkbox"]').forEach(cb => cb.checked = false); }
 
     const action = t.dataset.action;
     const val = t.dataset.val;
@@ -1479,7 +1987,7 @@ document.addEventListener('click', async e => {
         }
     }
     else if(action === 'reset-stats') {
-        if(confirm('确认重置统计?')) { 
+        if(confirm('确认重置文件 "' + val + '" 的访问统计?')) { 
             try {
                 await apiCall('/api/reset-stats', 'POST', {fileName: val});
                 const idx = [...appData.ipFiles, ...appData.editableFiles].findIndex(f => f.name === val);
@@ -1499,25 +2007,24 @@ document.addEventListener('click', async e => {
         if(!fileMeta) { showMsg('文件不存在', 'error'); return; }
         document.getElementById('edit-file-name').textContent = fileName;
         document.getElementById('edit-auto-update').checked = fileMeta.autoUpdate || false;
-        
         const renderEditChecks = () => {
             let html = '';
             if(appData.uploadedFiles.length) {
-                html += '<div style="grid-column:1/-1;font-weight:600;color:var(--primary);margin-top:2px;font-size:0.85rem">📂 上传的文件</div>';
+                html += '<div style="grid-column:1/-1;font-weight:700;color:var(--primary);margin-top:0.5rem;margin-bottom:0.75rem;padding-bottom:0.5rem;border-bottom:1px solid var(--border);">📂 上传的文件</div>';
                 appData.uploadedFiles.forEach(f => { 
                     const checked = fileMeta.sources.files && fileMeta.sources.files.includes(f) ? 'checked' : '';
                     html += '<label><input type="checkbox" value="' + escapeHtml(f) + '" class="edit-file-cb" ' + checked + '> ' + escapeHtml(f) + '</label>'; 
                 });
             }
             if(appData.editableFiles.length) {
-                html += '<div style="grid-column:1/-1;font-weight:600;color:#7c3aed;margin-top:2px;font-size:0.85rem">✏️ 可编辑文件</div>';
+                html += '<div style="grid-column:1/-1;font-weight:700;color:#7c3aed;margin-top:0.5rem;margin-bottom:0.75rem;padding-bottom:0.5rem;border-bottom:1px solid var(--border);">✏️ 可编辑文件</div>';
                 appData.editableFiles.forEach(f => { 
                     const checked = fileMeta.sources.files && fileMeta.sources.files.includes(f.name) ? 'checked' : '';
                     html += '<label><input type="checkbox" value="' + escapeHtml(f.name) + '" class="edit-file-cb" ' + checked + '> ' + escapeHtml(f.name) + '</label>'; 
                 });
             }
             if(appData.urls.length) {
-                html += '<div style="grid-column:1/-1;font-weight:600;color:var(--primary);margin-top:5px;font-size:0.85rem">📡 订阅链接</div>';
+                html += '<div style="grid-column:1/-1;font-weight:700;color:var(--primary);margin-top:1rem;margin-bottom:0.75rem;padding-bottom:0.5rem;border-bottom:1px solid var(--border);">📡 订阅链接</div>';
                 appData.urls.forEach((item,i) => { 
                     const name = item.name || ('订阅 #' + (i+1));
                     const checked = fileMeta.sources.urls && fileMeta.sources.urls.includes(i) ? 'checked' : '';
@@ -1525,14 +2032,14 @@ document.addEventListener('click', async e => {
                 });
             }
             if(appData.apis.length) {
-                html += '<div style="grid-column:1/-1;font-weight:600;color:var(--primary);margin-top:5px;font-size:0.85rem">🔗 API</div>';
+                html += '<div style="grid-column:1/-1;font-weight:700;color:var(--primary);margin-top:1rem;margin-bottom:0.75rem;padding-bottom:0.5rem;border-bottom:1px solid var(--border);">🔗 API</div>';
                 appData.apis.forEach((item,i) => { 
                     const name = item.name || ('API #' + (i+1));
                     const checked = fileMeta.sources.apis && fileMeta.sources.apis.includes(i) ? 'checked' : '';
                     html += '<label><input type="checkbox" value="' + i + '" class="edit-api-cb" ' + checked + '> ' + escapeHtml(name) + '</label>'; 
                 });
             }
-            return html || '<div style="color:#888;padding:10px">⚠️ 暂无数据源</div>';
+            return html || '<div style="color:var(--text-sub);padding:1rem;text-align:center;">⚠️ 暂无数据源</div>';
         };
         document.getElementById('edit-sources').innerHTML = renderEditChecks();
         document.getElementById('edit-custom').checked = fileMeta.sources.includeCustom || false;
@@ -1634,7 +2141,6 @@ document.addEventListener('click', async e => {
     
     if(t.id === 'btn-cancel-edit' || t.classList.contains('close')) {
         document.getElementById('edit-file-modal').style.display = 'none';
-        document.getElementById('edit-sources-modal').style.display = 'none';
         currentEditingFile = null;
         currentEditingIPs = [];
     }
@@ -1721,7 +2227,7 @@ async function doExtract(btn) {
         lastExtractResult = res.ips; 
         const resultEl = document.getElementById('extract-result');
         resultEl.innerText = '✅ 提取 ' + res.count + ' 个:\\n---\\n' + res.ips.join('\\n');
-        if(res.count > 0) document.getElementById('btn-copy-extract').style.display = 'block';
+        if(res.count > 0) document.getElementById('btn-copy-extract').style.display = 'inline-flex';
     } catch(e) { showMsg(e.message, 'error'); }
     btn.disabled=false; btn.innerText='🚀 立即提取';
 }
@@ -1734,7 +2240,7 @@ async function doSaveFile(btn) {
         if(res.meta) { appData.ipFiles.push({...res.meta, stats: {total:0, today:0, lastAccess: null}}); render(); }
         showMsg('生成成功'); document.getElementById('file-name').value='';
     } catch(e) { alert(e.message); }
-    btn.disabled=false; btn.innerText='💾 生成并保存文件';
+    btn.disabled=false; btn.innerText='💾 生成文件';
 }
 
 async function doTool(btn) {
@@ -1791,7 +2297,7 @@ function renderEditableIPList() {
         return \`<div class="editable-ip-item">
             <div class="editable-ip-text">\${escapeHtml(text)}</div>
             <div class="editable-ip-actions">
-                <button class="btn-danger btn-sm delete-ip-btn" data-index="\${index}">删除</button>
+                <button class="btn-danger btn-small delete-ip-btn" data-index="\${index}">🗑️</button>
             </div>
         </div>\`;
     }).join('');
