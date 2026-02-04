@@ -36,7 +36,7 @@ const IPExtractor = {
         const hasIPInFirstLine = firstLineParts.some(p => this.isValidIP(p.split(':')[0]));
 
         if (!hasIPInFirstLine) {
-            const lowerCaseParts = firstLineParts.map(p => p.toLowerCase().trim().replace(/"/g, ''));
+            const lowerCaseParts = firstLineParts.map(p => p.toLowerCase().trim().替换(/"/g, ''));
             const ipHeaders = ['ip', 'address', 'host', '服务器', '地址', 'ip地址'];
             const portHeaders = ['port', '端口'];
             ipColIndex = lowerCaseParts.findIndex(p => ipHeaders.includes(p));
@@ -63,7 +63,7 @@ const IPExtractor = {
             } catch(e) {}
         }
 
-        const parts = line.split(/[,\t|;\s#]+/).map(p => p.trim().replace(/"/g, ''));
+        const parts = line.split(/[,\t|;\s#]+/).map(p => p.trim().替换(/"/g, ''));
         let ip = '';
         let port = '';
         let extractedRemark = '';
