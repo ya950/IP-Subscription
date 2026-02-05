@@ -1,9 +1,9 @@
-// Cloudflare Workers 节点管理系统 v10.12 (纯净订阅版)
+// Cloudflare Workers 节点管理系统 v10.13 (短链增强版)
 // ==========================================
-// 更新日志 v10.12:
-// 1. [移除] 移除了不稳定的外部订阅转换功能
-// 2. [核心] 专注于本地模板注入，直接生成 Base64 订阅链接
-// 3. [优化] 界面精简，逻辑更直接
+// 更新日志 v10.13:
+// 1. [新增] 内置短链接服务 (/s/xxxx)，解决订阅链接过长问题
+// 2. [安全] 订阅模板配置存入 KV，URL 中不再暴露节点敏感信息
+// 3. [优化] 订阅生成弹窗 UI，支持长/短链接双模式
 // ==========================================
 
 const KV_BINDING_NAME = "IP_NODES"; 
@@ -263,6 +263,10 @@ export default {
     if (path.startsWith('/tpl/')) return await handleTemplateRequest(request, env, ctx, path);
     // ------------------
 
+    // --- 短链接订阅接口 ---
+    if (path.startsWith('/s/')) return await handleShortLinkRequest(request, env, ctx, path);
+    // ------------------
+
     if (path.startsWith('/r2/')) return await handleR2FileAccess(request, env, ctx, path);
     if ((path.startsWith('/ip/') && path.length > 4) || (path.length > 1 && path !== '/admin' && path !== '/' && !path.startsWith('/api/'))) return await handleIPFile(request, env, ctx, path);
     if (path === '/admin' || path === '/') return await handleAdmin(request, env);
@@ -276,7 +280,61 @@ export default {
 // 6. 核心处理函数
 // ==========================================
 
-// 处理模板订阅请求 (核心逻辑)
+// 处理短链接请求 /s/xxxx
+async function handleShortLinkRequest(request, env, ctx, path) {
+    const shortId = path.replace('/s/', '');
+    if (!shortId) return new Response('Invalid ID', { status: 400 });
+
+    // 从 KV 读取原始配置
+    const rawData = await env[KV_BINDING_NAME].get(`short_sub_${shortId}`);
+    if (!rawData) return new Response('Subscription Link Expired or Not Found', { status: 404 });
+
+    try {
+        const data = JSON.parse(rawData);
+        const { fileName, template } = data; // template 是原始字符串，非 base64
+
+        // 复用之前的逻辑：获取 IP 列表内容
+        let content = await DataAccessLayer.readFile(env, 'generated', fileName);
+        if (!content) {
+             const editableData = await DataAccessLayer.getEditableFile(env, fileName);
+             if (editableData && editableData.ips) {
+                 content = editableData.ips.map(ip => ip.port ? `${ip.ip}:${ip.port}#${ip.remark||''}` : `${ip.ip}#${ip.remark||''}`).join('\n');
+             }
+        }
+        if (!content) return new Response('Source File Not Found', { status: 404 });
+
+        // 记录统计
+        ctx.waitUntil(updateFileStats(env, fileName));
+
+        // 生成节点
+        const lines = content.split('\n');
+        const nodes = [];
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            const [ipPort, remark] = trimmed.split('#');
+            const [ip, port] = ipPort.split(':');
+            if (!ip) continue;
+            const newNode = replaceAddressInLink(template, ip, port, remark);
+            if (newNode) nodes.push(newNode);
+        }
+
+        const finalString = nodes.join('\n');
+        const base64Response = btoa(unescape(encodeURIComponent(finalString)));
+
+        return new Response(base64Response, {
+            headers: { 
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Access-Control-Allow-Origin': '*' 
+            }
+        });
+
+    } catch (e) {
+        return new Response('Error processing short link', { status: 500 });
+    }
+}
+
+// 处理模板订阅请求 (长链接逻辑)
 async function handleTemplateRequest(request, env, ctx, path) {
   const fileName = path.replace('/tpl/', '');
   const url = new URL(request.url);
@@ -318,7 +376,7 @@ async function handleTemplateRequest(request, env, ctx, path) {
         if (newNode) nodes.push(newNode);
     }
 
-    // 4. 返回 Base64 订阅 (重要：这就是 v2rayN 等软件需要的格式)
+    // 4. 返回 Base64 订阅
     const finalString = nodes.join('\n');
     const base64Response = btoa(unescape(encodeURIComponent(finalString)));
 
@@ -480,10 +538,27 @@ async function handleAPI(request, env, path) {
         break;
       case 'reset-stats': return await resetFileStats(request, env);
       case 'tool_query': return await handleToolQuery(request);
+      case 'create_short': return await createShortLink(request, env);
       case 'logout': return await logout(request, env);
     }
   } catch (error) { return new Response(JSON.stringify({ error: error.message }), { status: 500 }); }
   return new Response('Not Found', { status: 404 });
+}
+
+async function createShortLink(req, env) {
+    const { fileName, template } = await req.json();
+    if (!fileName || !template) return new Response(JSON.stringify({ error: 'Missing params' }), { status: 400 });
+
+    // 生成随机 6 位 ID
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let shortId = '';
+    for (let i = 0; i < 6; i++) shortId += chars.charAt(Math.floor(Math.random() * chars.length));
+
+    // 存入 KV
+    const data = JSON.stringify({ fileName, template });
+    await env[KV_BINDING_NAME].put(`short_sub_${shortId}`, data);
+
+    return new Response(JSON.stringify({ success: true, shortId }));
 }
 
 async function addItem(req, env, act) {
@@ -914,7 +989,7 @@ async function logout(req, env) { const c = req.headers.get('Cookie'); if(c) { c
 async function checkSession(req, env) { const c = req.headers.get('Cookie'); if(!c) return false; const id = c.match(/session=([^;]+)/)?.[1]; if(!id) return false; return await env[KV_BINDING_NAME].get(`session_${id}`) === 'valid'; }
 
 // ==========================================
-// 10. 管理页面 (现代化界面版 - 支持域名 + 防爆破 + 仅模板订阅)
+// 10. 管理页面 (现代化界面版 - 支持域名 + 防爆破 + 仅模板订阅 + 短链接)
 // ==========================================
 async function handleAdmin(req, env) {
   const url = new URL(req.url); 
@@ -1004,7 +1079,7 @@ async function handleAdmin(req, env) {
 }
   
 function getLoginPage(error = '') {
-    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>系统登录</title><style>:root{--primary:#6366f1;--bg:#f3f4f6;--surface:#ffffff;--text:#1f2937}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.login-box{background:var(--surface);padding:2.5rem;border-radius:1rem;box-shadow:0 20px 25px -5px rgba(0,0,0,0.1),0 10px 10px -5px rgba(0,0,0,0.04);width:100%;max-width:360px;text-align:center;backdrop-filter:blur(10px);background:rgba(255,255,255,0.95)}h2{margin-bottom:1.5rem;color:var(--text);font-weight:700;font-size:1.5rem}input{width:100%;padding:.75rem 1rem;margin-bottom:1rem;border:1px solid #e5e7eb;border-radius:.5rem;font-size:1rem;box-sizing:border-box;outline:none;transition:all .2s;background:rgba(255,255,255,0.9)}input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,0.2)}button{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.5rem;font-size:1rem;font-weight:600;cursor:pointer;transition:all .2s;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1)}button:hover{background:#4f46e5;transform:translateY(-2px);box-shadow:0 10px 15px -3px rgba(0,0,0,0.1)}.error{background:#fee2e2;color:#991b1b;padding:.75rem;border-radius:.5rem;margin-top:1rem;font-size:.875rem}</style></head><body><div class="login-box"><h2>🔒 节点管理系统 v10.12</h2><form method="POST" action="?action=login"><input type="password" name="password" placeholder="请输入访问密码" required autofocus><button type="submit">立即登录</button>${error?`<div class="error">${error}</div>`:''}</form></div></body></html>`;
+    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>系统登录</title><style>:root{--primary:#6366f1;--bg:#f3f4f6;--surface:#ffffff;--text:#1f2937}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.login-box{background:var(--surface);padding:2.5rem;border-radius:1rem;box-shadow:0 20px 25px -5px rgba(0,0,0,0.1),0 10px 10px -5px rgba(0,0,0,0.04);width:100%;max-width:360px;text-align:center;backdrop-filter:blur(10px);background:rgba(255,255,255,0.95)}h2{margin-bottom:1.5rem;color:var(--text);font-weight:700;font-size:1.5rem}input{width:100%;padding:.75rem 1rem;margin-bottom:1rem;border:1px solid #e5e7eb;border-radius:.5rem;font-size:1rem;box-sizing:border-box;outline:none;transition:all .2s;background:rgba(255,255,255,0.9)}input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,0.2)}button{width:100%;padding:.75rem;background:var(--primary);color:white;border:none;border-radius:.5rem;font-size:1rem;font-weight:600;cursor:pointer;transition:all .2s;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1)}button:hover{background:#4f46e5;transform:translateY(-2px);box-shadow:0 10px 15px -3px rgba(0,0,0,0.1)}.error{background:#fee2e2;color:#991b1b;padding:.75rem;border-radius:.5rem;margin-top:1rem;font-size:.875rem}</style></head><body><div class="login-box"><h2>🔒 节点管理系统 v10.13</h2><form method="POST" action="?action=login"><input type="password" name="password" placeholder="请输入访问密码" required autofocus><button type="submit">立即登录</button>${error?`<div class="error">${error}</div>`:''}</form></div></body></html>`;
 }
   
 function getAdminPage(base64Data, origin) {
@@ -1015,7 +1090,7 @@ function getAdminPage(base64Data, origin) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>节点 IP 管理控制台 v10.12</title>
+<title>节点 IP 管理控制台 v10.13</title>
 <style>
     :root { 
         --primary: #6366f1; 
@@ -1634,7 +1709,7 @@ function getAdminPage(base64Data, origin) {
 <body>
 <div class="container">
     <header>
-        <h1>⚡️ 节点管理控制台 v10.12</h1>
+        <h1>⚡️ 节点管理控制台 v10.13</h1>
         <a href="/api/logout" class="logout">
             <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
@@ -1903,19 +1978,28 @@ function getAdminPage(base64Data, origin) {
             </div>
 
             <div style="background: #f0f9ff; padding: 0.75rem; border-radius: 0.5rem; margin-bottom: 1rem; font-size: 0.875rem; color: #0369a1;">
-                <strong>原理：</strong> 将文件中的优选 IP 自动填入下方的节点模板中，并生成标准的 Base64 订阅链接。
+                <strong>原理：</strong> 将文件中的优选 IP 自动填入下方的节点模板中。
             </div>
+            
             <div class="form-group">
                 <label style="font-weight:600; font-size:0.9rem;">输入节点模板 (完整链接):</label>
-                <input type="text" id="tpl-input" placeholder="例如: vless://uuid@1.1.1.1:443?encryption=none...#模板" style="width:100%; margin-top:0.5rem;">
+                <input type="text" id="tpl-input" placeholder="例如: vless://uuid@1.1.1.1:443?..." style="width:100%; margin-top:0.5rem;">
             </div>
-            <button class="btn-primary" id="btn-gen-tpl-link" style="width:100%">⚡️ 生成订阅链接</button>
+
+            <div style="display:flex; gap: 1rem;">
+                <button class="btn-secondary" id="btn-gen-tpl-link" style="flex:1">🔗 生成长链接 (无状态)</button>
+                <button class="btn-primary" id="btn-gen-short-link" style="flex:1">⚡️ 生成短链接 (推荐)</button>
+            </div>
+
             <div id="tpl-result-area" style="display:none; margin-top:1rem;">
                 <label style="font-weight:600; font-size:0.9rem;">您的专属订阅链接:</label>
                 <div class="code-block">
-                    <span id="tpl-final-url"></span>
+                    <span id="tpl-final-url" style="word-break: break-all;"></span>
                     <span class="copy-icon" onclick="copyText('tpl-final-url')">📋</span>
                 </div>
+                <p id="short-link-tip" style="display:none; font-size:0.8rem; color:var(--text-sub); margin-top:0.5rem;">
+                    * 短链接已保存到系统，配置模板已内置。
+                </p>
             </div>
         </div>
     </div>
@@ -2090,10 +2174,11 @@ function getAdminPage(base64Data, origin) {
         currentSubFile = t.dataset.val;
         document.getElementById('sub-file-name').innerText = currentSubFile;
         document.getElementById('tpl-result-area').style.display = 'none';
+        document.getElementById('short-link-tip').style.display = 'none';
         document.getElementById('generate-sub-modal').style.display = 'block';
      }
 
-     // 生成模板订阅
+     // 生成长链接
      if (t.id === 'btn-gen-tpl-link') {
         const tpl = document.getElementById('tpl-input').value.trim();
         if (!tpl) return alert('请输入 VLESS/Trojan 模板链接');
@@ -2104,6 +2189,26 @@ function getAdminPage(base64Data, origin) {
         
         document.getElementById('tpl-final-url').innerText = finalUrl;
         document.getElementById('tpl-result-area').style.display = 'block';
+        document.getElementById('short-link-tip').style.display = 'none';
+     }
+
+     // 生成短链接 (v10.13新增)
+     if (t.id === 'btn-gen-short-link') {
+        const tpl = document.getElementById('tpl-input').value.trim();
+        if (!tpl) return alert('请输入 VLESS/Trojan 模板链接');
+        if (!tpl.startsWith('vless://') && !tpl.startsWith('trojan://') && !tpl.startsWith('ss://')) return alert('仅支持 vless, trojan 或 ss 协议');
+
+        t.disabled = true; t.innerText = '生成中...';
+        try {
+            const res = await apiCall('/api/create_short', 'POST', { fileName: currentSubFile, template: tpl });
+            if (res.success) {
+                const finalUrl = currentOrigin + '/s/' + res.shortId;
+                document.getElementById('tpl-final-url').innerText = finalUrl;
+                document.getElementById('tpl-result-area').style.display = 'block';
+                document.getElementById('short-link-tip').style.display = 'block';
+            }
+        } catch(e) { showMsg('生成失败: ' + e.message, 'error'); } 
+        finally { t.disabled = false; t.innerText = '⚡️ 生成短链接 (推荐)'; }
      }
      
      if(action === 'delete') {
@@ -2329,6 +2434,7 @@ function getAdminPage(base64Data, origin) {
      
      if(t.id === 'btn-cancel-edit' || t.classList.contains('close')) {
          document.getElementById('edit-file-modal').style.display = 'none';
+         document.getElementById('edit-sources-modal').style.display = 'none';
          currentEditingFile = null;
          currentEditingIPs = [];
      }
