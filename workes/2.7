@@ -892,6 +892,13 @@ async function sendTgMsg(env, chatId, text) {
 // ==========================================
 // 8. 修复版提取逻辑 (支持备注净化)
 // ==========================================
+// ==========================================
+// 8. 修复版提取逻辑 (支持备注净化)
+// ==========================================
+
+// 【新增】全局内存缓存：如果在同一批次内多次请求同一个源，直接复用结果，防拉黑且提速百倍
+const globalMemCache = new Map();
+
 async function performExtraction(env, sources, forceRefresh = false, remarkOps = null) {
   let nodeMap = new Map();
   const [urls, apis, uploadedFiles] = await Promise.all([
@@ -900,7 +907,6 @@ async function performExtraction(env, sources, forceRefresh = false, remarkOps =
       DataAccessLayer.readConfig(env, 'uploaded_files', [], forceRefresh)
   ]);
   let allCandidates = [];
-  // [Deleted] Custom IP processing
   
   if (sources.files && Array.isArray(sources.files)) {
       const filePromises = sources.files.map(async (fileName) => {
@@ -923,26 +929,31 @@ async function performExtraction(env, sources, forceRefresh = false, remarkOps =
   
   const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   
-  // 1. 串行处理 API 源
+  // 1. 处理 API 源 (加入内存复用)
   for (const i of (sources.apis || [])) {
       const item = apis[i];
       if (item && item.url) {
-          const tryFetchApi = async (targetUrl, isProxy = false) => {
+          const tryFetchApi = async (targetUrl, proxyLevel = 0) => {
+              // 检查内存缓存 (2分钟内有效)
+              const cacheKey = `api_${targetUrl}_${proxyLevel}`;
+              const cached = globalMemCache.get(cacheKey);
+              if (cached && (Date.now() - cached.time < 120000)) return cached.data;
+
               try {
-                  // 超时时间从 15000 延长到 25000 (25秒)，给大订阅源充足的时间
                   const c = new AbortController(); const id = setTimeout(() => c.abort(), 25000); 
                   const res = await fetch(targetUrl, { signal: c.signal, headers: { 'Cache-Control': 'no-store', 'User-Agent': BROWSER_UA } }); 
                   const txt = await res.text(); clearTimeout(id);
                   const nodes = IPExtractor.processBatch(txt);
                   
-                  if (nodes.length > 0) return nodes.map(r => ({...r, source: 'api'}));
-                  if (!isProxy && txt.toLowerCase().includes('<html')) throw new Error('API WAF Blocked');
+                  if (nodes.length > 0) {
+                      const resData = nodes.map(r => ({...r, source: 'api'}));
+                      globalMemCache.set(cacheKey, { time: Date.now(), data: resData }); // 存入缓存
+                      return resData;
+                  }
+                  if (proxyLevel === 0 && txt.toLowerCase().includes('<html')) throw new Error('API WAF Blocked');
                   return [];
               } catch(e) {
-                  if (!isProxy) {
-                      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(item.url)}`;
-                      return await tryFetchApi(proxyUrl, true);
-                  }
+                  if (proxyLevel === 0) return await tryFetchApi(`https://api.allorigins.win/raw?url=${encodeURIComponent(item.url)}`, 1);
                   return [];
               }
           };
@@ -951,26 +962,35 @@ async function performExtraction(env, sources, forceRefresh = false, remarkOps =
       }
   }
 
-  // 2. 串行处理 订阅源 (URL)
+  // 2. 处理 订阅源 URL (加入内存复用)
   for (const i of (sources.urls || [])) {
       const item = urls[i];
       if (item && item.url) {
-          const tryFetchUrl = async (targetUrl, isProxy = false) => {
+          const tryFetchUrl = async (targetUrl, proxyLevel = 0) => {
+              // 检查内存缓存 (2分钟内有效)
+              const cacheKey = `url_${targetUrl}_${proxyLevel}`;
+              const cached = globalMemCache.get(cacheKey);
+              if (cached && (Date.now() - cached.time < 120000)) {
+                  console.log(`[极速复用] 命中内存缓存，无需重复拉取: ${targetUrl}`);
+                  return cached.data;
+              }
+
               try {
-                  // 超时时间同样放宽到 25秒
                   const c = new AbortController(); const id = setTimeout(() => c.abort(), 25000); 
                   const res = await fetch(targetUrl, { headers: { 'User-Agent': BROWSER_UA, 'Cache-Control': 'no-store', 'Accept': 'text/plain,application/json,text/html,*/*' }, signal: c.signal }); 
                   const txt = await res.text(); clearTimeout(id);
                   const nodes = parseSubscription(txt);
                   
-                  if (nodes.length > 0) return nodes.map(r => ({...r, source: 'sub'}));
-                  if (!isProxy && txt.toLowerCase().includes('<html')) throw new Error('WAF Blocked');
+                  if (nodes.length > 0) {
+                      const resData = nodes.map(r => ({...r, source: 'sub'}));
+                      globalMemCache.set(cacheKey, { time: Date.now(), data: resData }); // 存入缓存
+                      return resData;
+                  }
+                  if (proxyLevel === 0 && txt.toLowerCase().includes('<html')) throw new Error('WAF Blocked');
                   return [];
               } catch(e) {
-                  if (!isProxy) {
-                      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(item.url)}`;
-                      return await tryFetchUrl(proxyUrl, true);
-                  }
+                  if (proxyLevel === 0) return await tryFetchUrl(`https://api.allorigins.win/raw?url=${encodeURIComponent(item.url)}`, 1);
+                  else if (proxyLevel === 1) return await tryFetchUrl(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(item.url)}`, 2);
                   return [];
               }
           };
@@ -978,6 +998,7 @@ async function performExtraction(env, sources, forceRefresh = false, remarkOps =
           r.forEach(x => allCandidates.push(x));
       }
   }
+
 
   // --- v10.18 备注净化逻辑 ---
   if (remarkOps && typeof remarkOps === 'string' && remarkOps.trim() !== '') {
