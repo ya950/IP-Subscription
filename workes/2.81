@@ -951,11 +951,15 @@ async function performExtraction(env, sources, forceRefresh = false, remarkOps =
   for (const i of (sources.apis || [])) {
       const item = apis[i];
       if (item && item.url) {
+          // [新增] 判断当前这个 API 是否开启了缓存功能
+          const enableBackup = item.useCache === true;
+
           const tryFetchApi = async (targetUrl, proxyLevel = 0) => {
-              // 检查内存缓存 (2分钟内有效)
               const cacheKey = `api_${targetUrl}_${proxyLevel}`;
               const cached = globalMemCache.get(cacheKey);
               if (cached && (Date.now() - cached.time < 120000)) return cached.data;
+
+              const backupName = `backup/api_${btoa(encodeURIComponent(item.url)).replace(/[^a-zA-Z0-9]/g, '').substring(0, 50)}.json`;
 
               try {
                   const c = new AbortController(); const id = setTimeout(() => c.abort(), 25000); 
@@ -965,13 +969,32 @@ async function performExtraction(env, sources, forceRefresh = false, remarkOps =
                   
                   if (nodes.length > 0) {
                       const resData = nodes.map(r => ({...r, source: 'api'}));
-                      globalMemCache.set(cacheKey, { time: Date.now(), data: resData }); // 存入缓存
+                      globalMemCache.set(cacheKey, { time: Date.now(), data: resData });
+                      
+                      // [核心修改] 只有勾选了“开启缓存”，才往 R2 里面写入数据
+                      if (enableBackup && (proxyLevel === 0 || proxyLevel === 1)) {
+                          await env[R2_BUCKET_NAME].put(backupName, JSON.stringify(resData)).catch(()=>{});
+                      }
                       return resData;
                   }
                   if (proxyLevel === 0 && txt.toLowerCase().includes('<html')) throw new Error('API WAF Blocked');
-                  return [];
+                  throw new Error('未抓取到有效节点');
               } catch(e) {
-                  if (proxyLevel === 0) return await tryFetchApi(`https://api.allorigins.win/raw?url=${encodeURIComponent(item.url)}`, 1);
+                  let retryRes = [];
+                  if (proxyLevel === 0) retryRes = await tryFetchApi(`https://api.allorigins.win/raw?url=${encodeURIComponent(item.url)}`, 1);
+                  if (retryRes && retryRes.length > 0) return retryRes;
+                  
+                  // [核心修改] 只有勾选了“开启缓存”，失败时才去 R2 找兜底数据
+                  if (enableBackup && proxyLevel === 0) {
+                      try {
+                          console.log(`[按需容灾生效] API ${item.url} 抓取失败，读取历史备份...`);
+                          const backupObj = await env[R2_BUCKET_NAME].get(backupName);
+                          if (backupObj) {
+                              const backupData = await backupObj.json();
+                              if (backupData && backupData.length > 0) return backupData;
+                          }
+                      } catch(err) {}
+                  }
                   return [];
               }
           };
@@ -988,6 +1011,9 @@ async function performExtraction(env, sources, forceRefresh = false, remarkOps =
               const cacheKey = `url_${targetUrl}_${proxyLevel}`;
               const cached = globalMemCache.get(cacheKey);
               if (cached && (Date.now() - cached.time < 120000)) return cached.data;
+
+              // [新增] 生成 R2 备份文件名
+              const backupName = `backup/url_${btoa(encodeURIComponent(targetUrl)).replace(/[^a-zA-Z0-9]/g, '').substring(0, 50)}.json`;
 
               try {
                   const c = new AbortController(); const id = setTimeout(() => c.abort(), 15000); 
@@ -1009,15 +1035,35 @@ async function performExtraction(env, sources, forceRefresh = false, remarkOps =
                   if (nodes.length > 0) {
                       const resData = nodes.map(r => ({...r, source: 'sub'}));
                       globalMemCache.set(cacheKey, { time: Date.now(), data: resData });
+                      
+                      // [新增] 抓取成功时，写入 R2 备份
+                      if (proxyLevel === 0 || proxyLevel === 1) {
+                          await env[R2_BUCKET_NAME].put(backupName, JSON.stringify(resData)).catch(()=>{});
+                      }
                       return resData;
                   }
                   
                   if (txt.toLowerCase().includes('<html') && proxyLevel < 3) throw new Error('WAF Blocked or No IPs parsed');
                   return [];
               } catch(e) {
-                  if (proxyLevel === 0) return await tryFetchUrl(`https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`, 1);
-                  else if (proxyLevel === 1) return await tryFetchUrl(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`, 2);
-                  else if (proxyLevel === 2) return await tryFetchUrl(`https://corsproxy.io/?${encodeURIComponent(targetUrl)}`, 3);
+                  let retryRes = [];
+                  // 代理重试轮询
+                  if (proxyLevel === 0) retryRes = await tryFetchUrl(`https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`, 1);
+                  else if (proxyLevel === 1) retryRes = await tryFetchUrl(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`, 2);
+                  else if (proxyLevel === 2) retryRes = await tryFetchUrl(`https://corsproxy.io/?${encodeURIComponent(targetUrl)}`, 3);
+                  
+                  if (retryRes && retryRes.length > 0) return retryRes;
+
+                  // [新增] 如果所有代理节点都失效了，读取 R2 备份兜底
+                  if (proxyLevel === 0) {
+                      try {
+                          const backupObj = await env[R2_BUCKET_NAME].get(backupName);
+                          if (backupObj) {
+                              const backupData = await backupObj.json();
+                              if (backupData && backupData.length > 0) return backupData;
+                          }
+                      } catch(err) {}
+                  }
                   return [];
               }
           };
@@ -1236,20 +1282,26 @@ async function handleAdmin(req, env) {
   ]);
 
   const fileEntries = Object.entries(manifest);
-  const filePromises = fileEntries.map(async ([name, meta]) => {
-      if (!meta) return null;
-      try {
-          const stats = await DataAccessLayer.getStats(env, name);
-          if (meta.editable) {
-              const editableData = await DataAccessLayer.getEditableFile(env, name);
-              return { type: 'editable', data: { ...meta, stats, ips: editableData ? editableData.ips : [] } };
-          } else {
-              return { type: 'generated', data: { ...meta, stats } };
-          }
-      } catch (e) { return null; }
-  });
-
-  const fileResults = await Promise.all(filePromises);
+  const fileResults = [];
+  
+  // [核心修复]：将 Promise.all 并发轰炸改为分批处理，每次处理 5 个
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < fileEntries.length; i += BATCH_SIZE) {
+      const batch = fileEntries.slice(i, i + BATCH_SIZE).map(async ([name, meta]) => {
+          if (!meta) return null;
+          try {
+              const stats = await DataAccessLayer.getStats(env, name);
+              if (meta.editable) {
+                  const editableData = await DataAccessLayer.getEditableFile(env, name);
+                  return { type: 'editable', data: { ...meta, stats, ips: editableData ? editableData.ips : [] } };
+              } else {
+                  return { type: 'generated', data: { ...meta, stats } };
+              }
+          } catch (e) { return null; }
+      });
+      const results = await Promise.all(batch);
+      fileResults.push(...results);
+  }
   const ipFiles = [];
   const editableFiles = [];
   
@@ -1392,9 +1444,13 @@ function getAdminPage(base64Data, origin) {
  
         <div id="apis-sub-tab" class="sub-tab-content">
             <h2>🔗 API 接口管理</h2>
-            <div class="form-group" style="display:flex; gap:0.75rem">
-                <input type="text" id="new-api-name" placeholder="名称 (选填)" style="flex:1">
-                <input type="text" id="new-api-link" placeholder="API 链接 (必填)" style="flex:2">
+            <div class="form-group" style="display:flex; align-items:center; gap:0.75rem; flex-wrap: wrap;">
+                <input type="text" id="new-api-name" placeholder="名称 (选填)" style="flex:1; min-width: 120px;">
+                <input type="text" id="new-api-link" placeholder="API 链接 (必填)" style="flex:2; min-width: 200px;">
+                <label style="display:flex; align-items:center; gap:0.25rem; cursor:pointer; font-weight:600; font-size:0.9rem; color:var(--warning);">
+                    <input type="checkbox" id="new-api-cache" style="width:1.2rem; height:1.2rem;">
+                    开启防断缓存 (仅不稳定源)
+                </label>
             </div>
             <button id="btn-add-api" class="btn-success">➕ 添加 API</button>
             <div class="item-list" id="api-list"></div>
@@ -1731,9 +1787,11 @@ function getAdminPage(base64Data, origin) {
 
  function render() {
      const renderSourceList = (id, list, type) => {
-         document.getElementById(id).innerHTML = list.map((item, i) => 
-             '<div class="item"><div class="item-content"><div style="font-weight:700;color:var(--text-main); font-size: 1rem;">' + (item.name ? escapeHtml(item.name) : '<span style="color:#94a3b8;font-style:italic">未命名</span>') + '</div><div style="font-size:0.875rem;color:var(--text-sub);margin-top:0.25rem;word-break:break-all">' + escapeHtml(item.url || item.value) + '</div></div><button class="btn-danger" data-action="delete" data-type="' + type + '" data-val="' + i + '" style="padding:0.5rem 1rem;font-size:0.875rem;">🗑️ 删除</button></div>'
-         ).join('');
+         document.getElementById(id).innerHTML = list.map((item, i) => {
+             // [新增] 只有 API 且开启了缓存，才显示个小标签
+             const cacheBadge = (type === 'apis' && item.useCache) ? '<span class="badge auto" style="margin-left:0.5rem; background:var(--warning-light); color:var(--warning);">📦 防断缓存</span>' : '';
+             return '<div class="item"><div class="item-content"><div style="font-weight:700;color:var(--text-main); font-size: 1rem;">' + (item.name ? escapeHtml(item.name) : '<span style="color:#94a3b8;font-style:italic">未命名</span>') + cacheBadge + '</div><div style="font-size:0.875rem;color:var(--text-sub);margin-top:0.25rem;word-break:break-all">' + escapeHtml(item.url || item.value) + '</div></div><button class="btn-danger" data-action="delete" data-type="' + type + '" data-val="' + i + '" style="padding:0.5rem 1rem;font-size:0.875rem;">🗑️ 删除</button></div>';
+         }).join('');
      };
      renderSourceList('url-list', appData.urls, 'urls');
      renderSourceList('api-list', appData.apis, 'apis');
@@ -2126,13 +2184,15 @@ function getAdminPage(base64Data, origin) {
      if(t.id === 'btn-add-api') {
          const name = document.getElementById('new-api-name').value;
          const url = document.getElementById('new-api-link').value;
+         const useCache = document.getElementById('new-api-cache').checked; // [新增] 获取勾选状态
          if(url) {
-             const item = {name, url}; appData.apis.push(item);
-             document.getElementById('new-api-name').value=''; document.getElementById('new-api-link').value='';
-             render(); apiCall('/api/apis', 'POST', {items:[item]}); showMsg('已添加');
+             const item = {name, url, useCache}; appData.apis.push(item); // [修改] 保存进 JSON
+             document.getElementById('new-api-name').value=''; 
+             document.getElementById('new-api-link').value='';
+             document.getElementById('new-api-cache').checked=false; // 恢复默认不勾选
+             render(); apiCall('/api/apis', 'POST', {items:[item]}); showMsg('已添加 API');
          }
      }
-     
      if(t.id === 'btn-add-tpl') {
          const name = document.getElementById('new-tpl-name').value;
          const value = document.getElementById('new-tpl-value').value;
