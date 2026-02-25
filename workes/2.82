@@ -562,16 +562,84 @@ async function handleAPI(request, env, path) {
       case 'create_short': return await createShortLink(request, env);
       
       // ========= [新增：手动触发 Cron 接口] =========
-      case 'force_cron': 
-          await handleCronJob(env);
-          return new Response(JSON.stringify({ success: true, msg: "后台自动更新已手动执行完毕！" }));
-      // ===========================================
-      
-      case 'logout': return await logout(request, env);
-    }
-  } catch (error) { return new Response(JSON.stringify({ error: error.message }), { status: 500 }); }
+  case 'force_cron':
+ await handleCronJob(env);
+ return new Response(JSON.stringify({ success: true, msg: "后台自动更新已手动执行完毕！" }));
+ // ===========================================
+
+ case 'backup': return await exportBackup(env);
+ case 'import_backup': return await importBackup(request, env);
+ case 'logout': return await logout(request, env);
+ }
+} catch (error) { return new Response(JSON.stringify({ error: error.message }), { status: 500 }); }
   return new Response('Not Found', { status: 404 });
 }
+
+// ========= [新增：备份与恢复的核心逻辑] =========
+async function exportBackup(env) {
+    const [urls, apis, sites_list, templates_list, manifest] = await Promise.all([
+        DataAccessLayer.readConfig(env, 'urls'),
+        DataAccessLayer.readConfig(env, 'apis'),
+        DataAccessLayer.readConfig(env, 'sites_list'),
+        DataAccessLayer.readConfig(env, 'templates_list'),
+        DataAccessLayer.getManifest(env)
+    ]);
+
+    const editableFilesData = {};
+    if (manifest) {
+        for (const [name, meta] of Object.entries(manifest)) {
+            if (meta.editable) {
+                const data = await DataAccessLayer.getEditableFile(env, name);
+                if (data && data.ips) editableFilesData[name] = data.ips;
+            }
+        }
+    }
+
+    const backupData = {
+        version: '10.19',
+        timestamp: new Date().toISOString(),
+        configs: { urls, apis, sites_list, templates_list, manifest },
+        editableFiles: editableFilesData
+    };
+
+    const fileName = `Node_Backup_${new Date().toISOString().split('T')[0]}.json`;
+    return new Response(JSON.stringify(backupData), {
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Disposition': `attachment; filename="${fileName}"`
+        }
+    });
+}
+
+async function importBackup(request, env) {
+    try {
+        const data = await request.json();
+        if (!data || !data.configs) throw new Error("无效的备份文件");
+
+        const { configs, editableFiles } = data;
+        if (configs.urls) await DataAccessLayer.writeConfig(env, 'urls', configs.urls);
+        if (configs.apis) await DataAccessLayer.writeConfig(env, 'apis', configs.apis);
+        if (configs.sites_list) await DataAccessLayer.writeConfig(env, 'sites_list', configs.sites_list);
+        if (configs.templates_list) await DataAccessLayer.writeConfig(env, 'templates_list', configs.templates_list);
+        
+        if (configs.manifest) {
+            await R2Manager.save(env, 'config', 'manifest', configs.manifest);
+            await CacheManager.setCache(env, 'manifest', 'all', configs.manifest);
+        }
+
+        if (editableFiles) {
+            for (const [name, ips] of Object.entries(editableFiles)) {
+                await DataAccessLayer.saveEditableFile(env, name, { ips });
+            }
+        }
+        
+        await CacheManager.clearTypeCache(env, 'metadata');
+        return new Response(JSON.stringify({success: true}));
+    } catch(e) {
+        return new Response(JSON.stringify({error: e.message}), {status: 400});
+    }
+}
+// =================================================
 
 async function createShortLink(req, env) {
     const { fileName, template } = await req.json();
@@ -2276,7 +2344,38 @@ function getAdminPage(base64Data, origin) {
      if(t.id === 'btn-tool-run') doTool(t);
      if(t.id === 'btn-tool-copy') { navigator.clipboard.writeText(document.getElementById('tool-output').innerText); showMsg('已复制'); }
      if(t.id === 'btn-tool-save') { saveToolResultAsEditable(); }
+
+     // ================== [这里是你漏掉的按钮点击事件] ==================
+     if(t.id === 'btn-export-backup' || btn.id === 'btn-export-backup') {
+         const exportBtn = document.getElementById('btn-export-backup');
+         exportBtn.disabled = true; exportBtn.innerText = '⏳ 正在打包数据...';
+         try {
+             fetch('/api/backup').then(res => {
+                 if (!res.ok) throw new Error('下载失败');
+                 return res.blob();
+             }).then(blob => {
+                 const url = window.URL.createObjectURL(blob);
+                 const a = document.createElement('a');
+                 a.href = url;
+                 a.download = 'Node_Backup_' + new Date().toISOString().split('T')[0] + '.json';
+                 document.body.appendChild(a);
+                 a.click();
+                 document.body.removeChild(a);
+                 window.URL.revokeObjectURL(url);
+                 showMsg('🎉 备份下载成功！', 'success');
+                 exportBtn.disabled = false; exportBtn.innerText = '⬇️ 导出备份数据 (JSON)';
+             }).catch(e => {
+                 showMsg('备份失败: ' + e.message, 'error');
+                 exportBtn.disabled = false; exportBtn.innerText = '⬇️ 导出备份数据 (JSON)';
+             });
+         } catch (e) { showMsg('发生错误', 'error'); }
+     }
      
+     if(t.id === 'btn-import-backup-trigger' || btn.id === 'btn-import-backup-trigger') {
+         document.getElementById('backup-file-input').click();
+     }
+     // =================================================================
+
      if(t.id === 'btn-create-editable') {
          const fileName = prompt('请输入文件名:');
          if(fileName) {
@@ -2380,20 +2479,43 @@ function getAdminPage(base64Data, origin) {
  }
   
  document.getElementById('file-input').addEventListener('change', async function() {
-     if(!this.files.length) return;
-     const fd = new FormData(); fd.append('file', this.files[0]);
-     showMsg('上传中...', 'success');
-     try {
-         const res = await fetch('/api/upload', {method:'POST', body:fd});
-         const j = await res.json();
-         if(!res.ok) throw new Error(j.error || '上传失败');
-         if(!appData.uploadedFiles.includes(j.fileName)) { appData.uploadedFiles.push(j.fileName); render(); }
-         showMsg('上传成功: ' + j.fileName);
-     } catch(e) { showMsg(e.message, 'error'); }
-     this.value = '';
- });
-  
- function getLines(id) { return document.getElementById(id).value.split('\\n').map(x=>x.trim()).filter(x=>x); }
+if(!this.files.length) return;
+const fd = new FormData(); fd.append('file', this.files[0]);
+showMsg('上传中...', 'success');
+try {
+const res = await fetch('/api/upload', {method:'POST', body:fd});
+const j = await res.json();
+if(!res.ok) throw new Error(j.error || '上传失败');
+if(!appData.uploadedFiles.includes(j.fileName)) { appData.uploadedFiles.push(j.fileName); render(); }
+showMsg('上传成功: ' + j.fileName);
+} catch(e) { showMsg(e.message, 'error'); }
+this.value = '';
+});
+
+document.getElementById('backup-file-input').addEventListener('change', async function() {
+if(!this.files.length) return;
+const file = this.files[0];
+const reader = new FileReader();
+showMsg('正在读取备份文件...', 'success');
+reader.onload = async function(e) {
+try {
+const data = JSON.parse(e.target.result);
+if(!data.configs) throw new Error("无效的备份文件格式");
+showMsg('正在恢复数据，请勿关闭页面...', 'success');
+const res = await apiCall('/api/import_backup', 'POST', data);
+if(res.success) {
+alert('🎉 数据恢复成功！点击确定将刷新页面加载最新数据。');
+location.reload();
+} else {
+showMsg(res.error || '恢复失败', 'error');
+}
+} catch(err) { showMsg('解析失败: ' + err.message, 'error'); }
+};
+reader.readAsText(file);
+this.value = ''; 
+});
+
+function getLines(id) { return document.getElementById(id).value.split('\\n').map(x=>x.trim()).filter(x=>x); }
  function showMsg(txt, type) {
      if(!type) type = 'success';
      const m = document.getElementById('message'); m.innerText=txt; m.className='message '+type; m.style.display='block';
