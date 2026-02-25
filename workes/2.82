@@ -1234,9 +1234,36 @@ async function handleToolQuery(request) {
     return new Response(JSON.stringify({ results: finalResults }), { headers: { 'Content-Type': 'application/json' } });
 }
 
-async function logout(req, env) { const c = req.headers.get('Cookie'); if(c) { const id = c.split('session=')[1]?.split(';')[0]; if(id) await env[KV_BINDING_NAME].delete(`session_${id}`); } return new Response(null, { status: 302, headers: { 'Set-Cookie': 'session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0', 'Location': '/admin' } }); }
+async function logout(req, env) { 
+    const c = req.headers.get('Cookie'); 
+    if(c) { 
+        const id = c.split('session=')[1]?.split(';')[0]; 
+        if(id) {
+            try { await env[KV_BINDING_NAME].delete(`session_${id}`); } catch(e){} 
+            try { await env[R2_BUCKET_NAME].delete(`sessions/${id}`); } catch(e){} // [新增] 退出时清理 R2 的 session
+        }
+    } 
+    return new Response(null, { status: 302, headers: { 'Set-Cookie': 'session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0', 'Location': '/admin' } }); 
+}
 
-async function checkSession(req, env) { const c = req.headers.get('Cookie'); if(!c) return false; const id = c.match(/session=([^;]+)/)?.[1]; if(!id) return false; return await env[KV_BINDING_NAME].get(`session_${id}`) === 'valid'; }
+async function checkSession(req, env) { 
+    const c = req.headers.get('Cookie'); if(!c) return false; 
+    const id = c.match(/session=([^;]+)/)?.[1]; if(!id) return false; 
+    
+    // 1. 优先查 KV
+    try { 
+        const kvCheck = await env[KV_BINDING_NAME].get(`session_${id}`);
+        if (kvCheck === 'valid') return true;
+    } catch(e) {}
+    
+    // 2. 【R2 兜底】如果 KV 查不到或抛出配额异常，去 R2 找对应的 UUID 凭证
+    try {
+        const r2Check = await env[R2_BUCKET_NAME].get(`sessions/${id}`);
+        if (r2Check) return true;
+    } catch(e) {}
+    
+    return false;
+}
 
 // ==========================================
 // 10. 管理页面 (并行加载优化版)
@@ -1252,7 +1279,9 @@ async function handleAdmin(req, env) {
   }
 
   if (url.searchParams.get('action') === 'login') {
-    const failRecord = await env[KV_BINDING_NAME].get(failKey, { type: 'json' }) || { count: 0, blockUntil: 0 };
+    let failRecord = { count: 0, blockUntil: 0 };
+    try { failRecord = await env[KV_BINDING_NAME].get(failKey, { type: 'json' }) || { count: 0, blockUntil: 0 }; } catch(e){}
+    
     const now = Date.now();
     if (failRecord.blockUntil > now) {
         const waitMs = failRecord.blockUntil - now;
@@ -1264,15 +1293,21 @@ async function handleAdmin(req, env) {
 
     const fd = await req.formData();
     if (fd.get('password') === env.ADMIN_PASSWORD) {
-      await env[KV_BINDING_NAME].delete(failKey);
+      try { await env[KV_BINDING_NAME].delete(failKey); } catch(e){}
       const id = crypto.randomUUID(); 
-      await env[KV_BINDING_NAME].put(`session_${id}`, 'valid', { expirationTtl: 86400 });
+      try {
+          // 优先存入 KV
+          await env[KV_BINDING_NAME].put(`session_${id}`, 'valid', { expirationTtl: 86400 });
+      } catch(e) {
+          // 【R2 兜底安全写入】KV 满了，则在 R2 的 sessions/ 目录下生成一个校验文件，完全没有密码泄漏风险
+          await env[R2_BUCKET_NAME].put(`sessions/${id}`, 'valid').catch(()=>{});
+      }
       return new Response('', { status: 302, headers: { 'Set-Cookie': `session=${id}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400`, 'Location': '/admin' } });
     } else {
       failRecord.count = (failRecord.count || 0) + 1;
       let errorMsg = `密码错误 (已尝试 ${failRecord.count} 次)`;
       if (failRecord.count >= 5) { failRecord.blockUntil = now + 86400000; errorMsg = `密码错误。失败次数过多，IP 已被锁定 24 小时。`; }
-      await env[KV_BINDING_NAME].put(failKey, JSON.stringify(failRecord), { expirationTtl: 86460 });
+      try { await env[KV_BINDING_NAME].put(failKey, JSON.stringify(failRecord), { expirationTtl: 86460 }); } catch(e){}
       return new Response(getLoginPage(errorMsg), { headers: { 'Content-Type': 'text/html; charset=utf-8' }});
     }
   }
